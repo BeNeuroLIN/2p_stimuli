@@ -1,2 +1,3 @@
 # Stimulus code for the two photon microscope
-main: visual stimulus
+Paula Pflitsch
+visual stimulus
