@@ -8,8 +8,23 @@ from stytra.stimulation.stimuli.visual import Pause #Required for black screen "
 from lightparam import Param #Required so we can change parameters in the GUI
 from PyQt5.QtCore import QRect
 from PyQt5.QtGui import QBrush,QColor
-
+from pypylon import pylon
 import random #Allow random choice of stimulus direction
+import time
+import traceback
+
+'''
+#camera basler
+camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
+camera.Open()
+
+camera.UserSetSelector = 'Default'
+camera.UserSetLoad.Execute()
+camera.ExposureTime = camera.ExposureTime.Min
+
+camera.ResultingFrameRate.Value # show frame rate
+'''
+
 
 #1. Define A visual Stimulus (for projector)
 # closed loop visual stimulus with moving dots
@@ -53,7 +68,7 @@ class VisualStim_dots(Protocol):
     # In this particular case, we add a stream of frames from a spinnaker camera
     stytra_config = dict(
         tracking=dict(embedded=True, method="tail", estimator="vigor"),
-        camera=dict(camera=dict(type="spinnaker")),
+        camera=dict(camera=dict(type="opencv", cam_idx=0)), #open cv for a basler camera
     )
 
 # Define the parameters which will be changeable in the Graphical User Interface (GUI)
@@ -147,4 +162,4 @@ class VisualStim_dots(Protocol):
 
 if __name__ == "__main__":
     # This is the line that actually opens stytra with the new protocol.
-    st = Stytra(protocol=VisualStim_dots(), camera=dict(type="spinnaker"),stim_plot=True)
+    st = Stytra(protocol=VisualStim_dots(), camera=dict(type="opencv",cam_idx=0),stim_plot=True)

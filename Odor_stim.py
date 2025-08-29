@@ -8,7 +8,7 @@ from stytra.stimulation.stimuli.visual import Pause #Required for black screen "
 from lightparam import Param #Required so we can change parameters in the GUI
 from stytra.stimulation.stimuli.arduino import WriteArduinoPin
 
-import random #Allow random choice of stimulus direction
+from pypylon import pylon
 
 
 # 1. Define a protocol
@@ -19,7 +19,7 @@ class Odor_protocol(Protocol):
     # In this particular case, we add a stream of frames from a spinnaker camera
     stytra_config = dict(
         tracking=dict(embedded=True, method="tail"),
-        camera=dict(camera=dict(type="spinnaker")),
+        camera=dict(camera=dict(type="basler")),
         #Change the arduino configuration here!
         #Before using a pin in the protocol it needs to be set up here.
         arduino_config=dict(
@@ -82,4 +82,4 @@ class Odor_protocol(Protocol):
 
 if __name__ == "__main__":
     # This is the line that actually opens stytra with the new protocol.
-    st = Stytra(protocol=Odor_protocol(), camera=dict(type="spinnaker"))
+    st = Stytra(protocol=Odor_protocol(), camera=dict(type="basler"))
