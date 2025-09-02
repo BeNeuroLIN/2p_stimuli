@@ -13,17 +13,16 @@ import random #Allow random choice of stimulus direction
 import time
 import traceback
 
-'''
-#camera basler
-camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
-camera.Open()
+#test if edited package is installed
+import stytra; print(stytra.__file__)
 
-camera.UserSetSelector = 'Default'
-camera.UserSetLoad.Execute()
-camera.ExposureTime = camera.ExposureTime.Min
+# see if key is registered
+from stytra.hardware.video.cameras import camera_class_dict
+print(sorted(camera_class_dict.keys()))
 
-camera.ResultingFrameRate.Value # show frame rate
-'''
+# verify pypylon sees camera
+from pypylon import pylon
+print(pylon.TlFactory.GetInstance().EnumerateDevices())
 
 
 #1. Define A visual Stimulus (for projector)
@@ -68,7 +67,7 @@ class VisualStim_dots(Protocol):
     # In this particular case, we add a stream of frames from a spinnaker camera
     stytra_config = dict(
         tracking=dict(embedded=True, method="tail", estimator="vigor"),
-        camera=dict(camera=dict(type="opencv", cam_idx=0)), #open cv for a basler camera
+        camera=dict(camera=dict(type="basler", cam_idx=0)),
     )
 
 # Define the parameters which will be changeable in the Graphical User Interface (GUI)
@@ -92,7 +91,7 @@ class VisualStim_dots(Protocol):
             stimuli.append(
                 ContinuousRandomDotKinematogram(
                     dot_density=0.3,
-                    dot_radius=0.4,
+                    dot_radius=0.6, #0.4
                     df_param=pd.DataFrame(
                         dict(
                             # t=[self.duration_of_stimulus_in_seconds],
@@ -110,7 +109,7 @@ class VisualStim_dots(Protocol):
             stimuli.append(
                 ContinuousRandomDotKinematogram(
                     dot_density=0.3,
-                    dot_radius=0.4,
+                    dot_radius=0.6,
                     df_param=pd.DataFrame(
                         dict(
                             # t describes the time (in seconds) the stimulus is shown
@@ -141,7 +140,7 @@ class VisualStim_dots(Protocol):
             stimuli.append(
                 ContinuousRandomDotKinematogram(
                     dot_density=0.3,
-                    dot_radius=0.4,
+                    dot_radius=0.6,
                     df_param=pd.DataFrame(
                         dict(
                             #t=[self.duration_of_stimulus_in_seconds],
@@ -162,4 +161,4 @@ class VisualStim_dots(Protocol):
 
 if __name__ == "__main__":
     # This is the line that actually opens stytra with the new protocol.
-    st = Stytra(protocol=VisualStim_dots(), camera=dict(type="opencv",cam_idx=0),stim_plot=True)
+    st = Stytra(protocol=VisualStim_dots(), camera=dict(type="basler",cam_idx=0),stim_plot=True)
