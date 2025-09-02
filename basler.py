@@ -72,88 +72,90 @@ class BaslerCamera(Camera):
         return ["I:Basler camera opened"]
 
     def set(self, param, val):
-        """
-
-        Parameters
-        ----------
-        param :
-
-        val :
-
-
-        Returns
-        -------
-
-        """
-        # pass
-        # # try:
-
         if self.cam is None:
             return "W: camera not open"
-        nm=self.camera.GetNodeMap()
 
-        if param == "exposure":
-            self.camera.ExposureTime = val * 1000
-            return ""
-        # elif param == "framerate":
-        #     self.camera.FrameRate = 100
-        elif param == "gain":
-            self.camera.Gain = val
-        else:
-            return "W: " + param + " not implemented"
+        nm = self.cam.GetNodeMap()
+
+        try:
+            if param == "exposure":
+                # Stytra usually passes milliseconds; Basler wants microseconds
+                us = float(val) * 1000.0
+                _enum_set(nm, "ExposureAuto", "Off")
+                ok = _float_set(nm, ["ExposureTime", "ExposureTimeAbs"], us)
+                return "" if ok else "W: exposure control not supported on this model"
+
+            elif param == "framerate":
+                # Not all GigE models support this; try common nodes
+                try:
+                    pylon.BooleanParameter(nm, "AcquisitionFrameRateEnable").SetValue(True)
+                except Exception:
+                    pass
+                ok = _float_set(nm, ["AcquisitionFrameRate", "AcquisitionFrameRateAbs"], float(val))
+                return "" if ok else "W: framerate control not supported"
+
+            elif param == "gain":
+                _enum_set(nm, "GainAuto", "Off")
+                ok = _float_set(nm, ["Gain", "GainRaw"], float(val))
+                return "" if ok else "W: gain control not supported"
+
+            elif param == "roi":
+                # val = (x, y, w, h)
+                try:
+                    x, y, w, h = map(int, val)
+                except Exception:
+                    return "W: roi expects (x,y,w,h)"
+                need_restart = self.cam.IsGrabbing()
+                if need_restart:
+                    self.cam.StopGrabbing()
+                try:
+                    for name, v in (("OffsetX", x), ("OffsetY", y), ("Width", w), ("Height", h)):
+                        try:
+                            par = pylon.IntegerParameter(nm, name)
+                            if par.IsWritable():
+                                inc = getattr(par, "GetInc", lambda: 1)()
+                                lo, hi = par.GetMin(), par.GetMax()
+                                vv = max(min(v - (v - lo) % max(1, inc), hi), lo)
+                                par.SetValue(vv)
+                        except Exception:
+                            pass
+                finally:
+                    if need_restart:
+                        self.cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+                return ""
+
+            else:
+                return f"W: {param} not implemented"
+
+        except Exception as e:
+            return f"W: set({param}) failed: {e}"
 
     def read(self):
-        """ """
-        grabResult = self.camera.RetrieveResult(
-            5000, pylon.TimeoutHandling_ThrowException
-        )
-
-        if grabResult.GrabSucceeded():
-            # Access the image data.
-            # print("SizeX: ", grabResult.Width)
-            # print("SizeY: ", grabResult.Height)
-            img = grabResult.Array
-            # print("Gray value of first pixel: ", img[0, 0])
-            grabResult.Release()
-            return img
-
-        else:
+        if self.cam is None or not self.cam.IsGrabbing():
             return None
 
-        # return res.Array
+        grab = self.cam.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+        try:
+            if grab.GrabSucceeded():
+                arr = grab.Array
+                # ensure 2D grayscale for Stytra (drop channel if Bayer/RGB sneaks in)
+                if arr.ndim == 3:
+                    arr = arr[:, :, 0]
+                return arr
+            return None
+        finally:
+            grab.Release()
 
     def release(self):
-        """ """
-        pass
-        # self.camera.stopGrabbing()
-
-
-if __name__ == "__main__":
-    camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
-    i = camera.GetNodeMap()
-
-    # camera.Open()
-    # camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
-    # res = camera.RetrieveResult(0, pylon.TimeoutHandling_Return)
-    # print(res)
-    # re.
-    # print(res.Array)
-    # camera.stopGrabbing()
-    # camera.Close()
-
-    # camera = pylon.InstantCamera(
-    #     pylon.TlFactory.GetInstance().CreateFirstDevice())
-    camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
-    camera.FrameRate = 10
-
-    # while camera.IsGrabbing():
-    grabResult = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
-
-    if grabResult.GrabSucceeded():
-        # Access the image data.
-        print("SizeX: ", grabResult.Width)
-        print("SizeY: ", grabResult.Height)
-        img = grabResult.Array
-        print("Gray value of first pixel: ", img[0, 0])
-
-    grabResult.Release()
+        if self.cam:
+            try:
+                if self.cam.IsGrabbing():
+                    self.cam.StopGrabbing()
+            except Exception:
+                pass
+            try:
+                if self.cam.IsOpen():
+                    self.cam.Close()
+            except Exception:
+                pass
+            self.cam = None
