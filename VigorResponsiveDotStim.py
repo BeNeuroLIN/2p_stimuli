@@ -13,10 +13,15 @@ from PyQt5.QtGui import QBrush, QColor
 
 # ------------------ closed-loop subclass ------------------
 
+from PyQt5.QtCore import QRect
+from PyQt5.QtGui import QBrush, QColor
+import time
+from stytra.stimulation.stimuli.kinematograms import ContinuousRandomDotKinematogram
+
 class VigorResponsiveDotStim(ContinuousRandomDotKinematogram):
     """
-    Shows moving dots, but paints the screen black whenever the fish's
-    tail vigor exceeds `vigor_threshold`. Logs ON/OFF transitions.
+    Moving dots with vigor-triggered blackout (and BLACKOUT_ON/OFF event logs).
+    NOTE: Do not store Qt objects on self; Stytra deep-copies stimuli.
     """
     def __init__(self, *args,
                  vigor_threshold=30.0,
@@ -28,20 +33,21 @@ class VigorResponsiveDotStim(ContinuousRandomDotKinematogram):
         self.hysteresis = float(hysteresis)
         self.blackout_min_ms = int(blackout_min_ms)
         self._blackout = False
-        self._last_switch_ms = 0
-        self._black_brush = QBrush(QColor(0, 0, 0))
+        self._last_switch_ms = 0  # ms since epoch
 
-    # --- helpers ---
+    # ---------- helpers ----------
     def _get_vigor(self):
         exp = getattr(self, "_experiment", None)
         if exp is None or not hasattr(exp, "estimator"):
             return None
+        # prefer estimator.vigor if present
         vig = getattr(exp.estimator, "vigor", None)
         if vig is not None:
             try:
                 return float(vig)
             except Exception:
                 return None
+        # fallback to |velocity|
         if hasattr(exp.estimator, "get_velocity"):
             try:
                 return abs(float(exp.estimator.get_velocity()))
@@ -50,9 +56,9 @@ class VigorResponsiveDotStim(ContinuousRandomDotKinematogram):
         return None
 
     def _switch_blackout(self, new_state: bool):
-        """Flip state and log an event timestamp (seconds)."""
         self._blackout = new_state
         self._last_switch_ms = int(time.time() * 1000)
+        # Log event to Stytra’s run log (seconds resolution)
         if hasattr(self, "log_event"):
             label = "BLACKOUT_ON" if new_state else "BLACKOUT_OFF"
             self.log_event(label, value=self._last_switch_ms / 1000.0)
@@ -69,7 +75,7 @@ class VigorResponsiveDotStim(ContinuousRandomDotKinematogram):
         elif self._blackout and vig <= (self.vigor_threshold - self.hysteresis):
             self._switch_blackout(False)
 
-    # --- stimulus API ---
+    # ---------- stimulus API ----------
     def update(self, *args, **kwargs):
         self._maybe_toggle_blackout()
         try:
@@ -79,10 +85,30 @@ class VigorResponsiveDotStim(ContinuousRandomDotKinematogram):
 
     def paint(self, p, w, h):
         if self._blackout:
-            p.setBrush(self._black_brush)
+            # Create Qt objects as locals (pickle-safe)
+            p.setBrush(QBrush(QColor(0, 0, 0)))
             p.drawRect(QRect(0, 0, w, h))
         else:
             super().paint(p, w, h)
+
+    # (Optional) make deepcopy/pickle extra safe:
+    def __getstate__(self):
+        # Return only pickle-safe state; base class state is pickleable.
+        return {
+            "vigor_threshold": self.vigor_threshold,
+            "hysteresis": self.hysteresis,
+            "blackout_min_ms": self.blackout_min_ms,
+            "_blackout": self._blackout,
+            "_last_switch_ms": self._last_switch_ms,
+        }
+
+    def __setstate__(self, state):
+        self.vigor_threshold = state["vigor_threshold"]
+        self.hysteresis = state["hysteresis"]
+        self.blackout_min_ms = state["blackout_min_ms"]
+        self._blackout = state["_blackout"]
+        self._last_switch_ms = state["_last_switch_ms"]
+
 
 # ------------------ protocol ------------------
 
