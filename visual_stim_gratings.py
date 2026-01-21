@@ -1,9 +1,5 @@
 ## 2p visual stimulus
 
-from stytra import Stytra, Protocol
-from lightparam import Param
-from stytra.stimulation.stimuli.arduino import WriteArduinoPin
-
 import numpy as np
 from stytra import Stytra, Protocol #Required for stytra interface usage
 import pandas as pd #Required for ContinuousRandomDotKinematogram
@@ -16,7 +12,6 @@ from pypylon import pylon
 import random #Allow random choice of stimulus direction
 import time
 import traceback
-
 
 #test if edited package is installed
 import stytra; print(stytra.__file__)
@@ -37,11 +32,10 @@ print(pylon.TlFactory.GetInstance().EnumerateDevices())
 
 # 2. Custom class that switches to black screen when vigor exceeds threshold
 class VigorResponsiveDotStim(ContinuousRandomDotKinematogram):
-    def __init__(self, *args, vigor_threshold=30.0,size=2, **kwargs):
+    def __init__(self, *args, vigor_threshold=30.0,**kwargs):
         super().__init__(*args,**kwargs)
         self.vigor_threshold=vigor_threshold
         self.blackout=False
-        self.size=2
 
     def paint(self, p,w,h):
         p.setBrush(QBrush(QColor(*self.color))) #use chosen color
@@ -67,7 +61,7 @@ class VigorResponsiveDotStim(ContinuousRandomDotKinematogram):
     '''
 # 3. Define a protocol subclass
 class VisualStim_dots(Protocol):
-    name = "VisualStim_dots"  # every protocol must have a name.
+    name = "VisualStim_gratings"  # every protocol must have a name.
     # In the stytra_config class attribute we specify a dictionary of
     # parameters that control camera, tracking, monitor, etc.
     # In this particular case, we add a stream of frames from a spinnaker camera
@@ -84,8 +78,7 @@ class VisualStim_dots(Protocol):
         self.duration_of_stimulus_in_seconds = Param(10, limits=None)
         self.pause_before_stimulus = Param (0, limits=None)
         self.pause_after_stimulus = Param (0, limits=None)
-        self.left_right = [0,3] #Create a list with parameters for right (3) or left (0) because the fish is flipped by 90 degrees
-        # make sure the projector display is portrait flipped, so that the calibration fish has the same orientation as the actual fish
+        self.left_right = [1, 2] #Create a list with parameters for right (1) or left (2) because the fish is flipped by 90 degrees
 
 # Define the sequence of stimuli in order
     # Pause = Black Screen

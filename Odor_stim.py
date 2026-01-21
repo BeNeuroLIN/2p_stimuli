@@ -4,7 +4,7 @@
 import numpy as np
 from stytra import Stytra, Protocol #Required for stytra interface usage
 import pandas as pd #Required for ContinuousRandomDotKinematogram
-from stytra.stimulation.stimuli.visual import Pause #Required for black screen "pauses" in stimuli
+#from stytra.stimulation.stimuli.visual import Pause #Required for black screen "pauses" in stimuli
 from lightparam import Param #Required so we can change parameters in the GUI
 from stytra.stimulation.stimuli.arduino import WriteArduinoPin
 
@@ -19,12 +19,15 @@ class Odor_protocol(Protocol):
     # In this particular case, we add a stream of frames from a spinnaker camera
     stytra_config = dict(
         tracking=dict(embedded=True, method="tail"),
-        camera=dict(camera=dict(type="basler")),
+        camera=dict(camera=dict(type="basler",cam_idx=0)),
         #Change the arduino configuration here!
         #Before using a pin in the protocol it needs to be set up here.
         arduino_config=dict(
             com_port="COM3", #string - On which com port is the arduino?
-            layout=[dict(pin=11, mode="output", ad="d")]
+            layout=[dict(pin=13, mode="output", ad="d"),
+                    dict(pin=3, mode="output", ad="d"),
+                    dict(pin=7, mode="output", ad="d"),
+                    dict(pin=11, mode="output", ad="d")]
             #layout of the pins you want to use later
             #pin = int (Number of pin to configure)
             #mode = string (Mode of the pin) "input", "output", "pwm" or "servo"
@@ -46,40 +49,58 @@ class Odor_protocol(Protocol):
         stimuli = [
             ]
         for i in range (self.number_of_repeats):
+            #test arduino is working with lightparam stimuli.append(
+            print("Light ON")
+            stimuli.append(
+                WriteArduinoPin(
+                    pin_values_dict={13: 1}, #{pin_number:voltage, ...} can be multiple
+                    duration=5
+                ),)
+            print("Light OFF")
+            stimuli.append(
+                WriteArduinoPin(
+                    pin_values_dict={13: 0},  # {pin_number:voltage, ...} can be multiple
+                    duration=5
+                ), )
             # water ON
+            print("Water ON")
             stimuli.append(
                 #The following commands change the voltage on arduino pins
                 WriteArduinoPin(
                     pin_values_dict={11: 1}, #{pin_number:voltage, ...} can be multiple
-                    duration=60
+                    duration=5
                 ),)
             # water OFF
+            print("Water OFF")
             stimuli.append(
                 WriteArduinoPin(
                     pin_values_dict={11: 0}, #{pin_number:voltage, ...} can be multiple
                     duration=1
                 ),)
             # cadaverine ON
+            print("Cadaverine ON")
             stimuli.append(
                 WriteArduinoPin(
                     pin_values_dict={3: 1},  # {pin_number:voltage, ...} can be multiple
-                    duration=20
+                    duration=5
                 ),)
             # cadaverine OFF
+            print("Cadaverine OFF")
             stimuli.append(
                 WriteArduinoPin(
                     pin_values_dict={3: 0},  # {pin_number:voltage, ...} can be multiple
-                    duration=20
+                    duration=1
                 ),)
             # water ON
+            print("Water ON")
             stimuli.append(
                 # The following commands change the voltage on arduino pins
                 WriteArduinoPin(
                     pin_values_dict={11: 1},  # {pin_number:voltage, ...} can be multiple
-                    duration=60
+                    duration=5
                 ),)
         return stimuli
 
 if __name__ == "__main__":
     # This is the line that actually opens stytra with the new protocol.
-    st = Stytra(protocol=Odor_protocol(), camera=dict(type="basler"))
+    st = Stytra(protocol=Odor_protocol(), camera=dict(type="basler",cam_idx=0))
