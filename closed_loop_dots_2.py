@@ -29,11 +29,13 @@ print(pylon.TlFactory.GetInstance().EnumerateDevices())
 
 # Custom class that drops coherence when vigor exceeds threshold
 class VigorResponsiveDotStim(ContinuousRandomDotKinematogram):
-    def __init__(self, *args, vigor_threshold=-5.0, original_coherence=1.0, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, vigor_threshold=-1.0, original_coherence=1.0, **kwargs):
+        # Remove custom parameters before passing to parent
         self.vigor_threshold = vigor_threshold
         self.original_coherence = original_coherence
         self.coherence_dropped = False
+        self.current_coherence = original_coherence  # Track current coherence
+        super().__init__(*args, **kwargs)
 
     def update(self):
         # Get current vigor from the experiment's estimator
@@ -42,8 +44,8 @@ class VigorResponsiveDotStim(ContinuousRandomDotKinematogram):
                 try:
                     vigor = self._experiment.estimator.get_velocity()
 
-                    # Print vigor value only when it's lower than -5 (significant activity)
-                    if vigor is not None and vigor < -5:
+                    # Print vigor value only when it's lower than -0.2 (significant activity)
+                    if vigor is not None and vigor < -0.2:
                         print(f"Current vigor: {vigor:.3f}")
 
                     # If vigor is lower than threshold, drop coherence to 0
@@ -52,10 +54,33 @@ class VigorResponsiveDotStim(ContinuousRandomDotKinematogram):
                             # Modify the dataframe to set coherence to 0
                             self.df_param.loc[:, 'coherence'] = 0
                             self.coherence_dropped = True
+                            self.current_coherence = 0.0  # Update current coherence
                             print(
                                 f">>> VIGOR THRESHOLD EXCEEDED ({vigor:.2f} < {self.vigor_threshold}). COHERENCE DROPPED TO 0. <<<")
+
+                    # Update the experiment's dynamic log with current coherence
+                    if hasattr(self._experiment, 'dynamic_log'):
+                        self._experiment.dynamic_log.update_param('current_coherence', self.current_coherence)
+
                 except Exception as e:
                     print(f"Error getting vigor: {e}")
+
+        # Call parent update method
+        super().update()
+
+
+# Wrapper class for tracking coherence in non-responsive stimuli
+class TrackedDotStim(ContinuousRandomDotKinematogram):
+    def __init__(self, *args, tracked_coherence=0.0, **kwargs):
+        # Store coherence value and remove it from kwargs before passing to parent
+        self.coherence_value = tracked_coherence
+        super().__init__(*args, **kwargs)
+
+    def update(self):
+        # Update the experiment's dynamic log with current coherence
+        if hasattr(self, '_experiment') and self._experiment is not None:
+            if hasattr(self._experiment, 'dynamic_log'):
+                self._experiment.dynamic_log.update_param('current_coherence', self.coherence_value)
 
         # Call parent update method
         super().update()
@@ -76,7 +101,7 @@ class VisualStim_dots(Protocol):
         self.duration_of_stimulus_in_seconds = Param(10, limits=None)
         self.pause_before_stimulus = Param(0, limits=None)
         self.pause_after_stimulus = Param(0, limits=None)
-        self.vigor_threshold = Param(-5.0, limits=(-100, 100))  # Add vigor threshold as parameter with explicit limits
+        self.vigor_threshold = Param(-1.0, limits=(-100, 100))  # Add vigor threshold as parameter with explicit limits
         self.left_right = [0, 3]  # Right (0) or left (3)
 
     def get_stim_sequence(self):
@@ -85,41 +110,41 @@ class VisualStim_dots(Protocol):
         for i in range(self.number_of_repeats):
             # Pre-stimulus 0% coherence (30 seconds)
             stimuli.append(
-                ContinuousRandomDotKinematogram(
+                TrackedDotStim(
                     dot_density=0.3,
                     dot_radius=0.6,
                     df_param=pd.DataFrame(
                         dict(
-                            t=[10],
+                            t=[30],
                             coherence=[0],
                             frozen=[0],
                             theta_relative=[random.choice(self.left_right)]
                         )
                     ),
+                    tracked_coherence=0.0  # Track that coherence is 0
                 ),
             )
 
             # 100% coherence left or right - WITH VIGOR RESPONSE (40 seconds)
-            stimuli.append(
-                VigorResponsiveDotStim(
-                    dot_density=0.3,
-                    dot_radius=0.6,
-                    df_param=pd.DataFrame(
-                        dict(
-                            t=[20],
-                            coherence=[1],  # Start at 100% coherence
-                            frozen=[0],
-                            theta_relative=[random.choice(self.left_right)]
-                        )
-                    ),
-                    vigor_threshold=float(self.vigor_threshold),  # Ensure it's passed as float
-                    original_coherence=1.0
+            vigor_stim = VigorResponsiveDotStim(
+                dot_density=0.3,
+                dot_radius=0.6,
+                df_param=pd.DataFrame(
+                    dict(
+                        t=[40],
+                        coherence=[1],  # Start at 100% coherence
+                        frozen=[0],
+                        theta_relative=[random.choice(self.left_right)]
+                    )
                 ),
+                vigor_threshold=float(self.vigor_threshold),  # Ensure it's passed as float
+                original_coherence=1.0
             )
+            stimuli.append(vigor_stim)
 
             # Post-stimulus 0% coherence (10 seconds)
             stimuli.append(
-                ContinuousRandomDotKinematogram(
+                TrackedDotStim(
                     dot_density=0.3,
                     dot_radius=0.6,
                     df_param=pd.DataFrame(
@@ -130,6 +155,7 @@ class VisualStim_dots(Protocol):
                             theta_relative=[random.choice(self.left_right)]
                         )
                     ),
+                    tracked_coherence=0.0  # Track that coherence is 0
                 ),
             )
 
