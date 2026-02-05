@@ -9,16 +9,15 @@ HOW IT WORKS
         ">>> WAITING FOR RISING EDGE …"
     and does NOT advance to the first stimulus.
 
-2.  A background thread continuously polls the configured digital‑input
-    channel on your NI DAQ board.
+2.  A background thread continuously polls the configured analog‑input
+    channel (AI0) on your NI DAQ board and compares it to a 2.5V threshold.
 
-3.  RISING EDGE detected  →  the stimulus sequence starts from the
-    beginning (pre‑stim → coherent motion → post‑stim, repeated N times).
+3.  RISING EDGE (voltage crosses above 2.5V)  →  the stimulus sequence
+    starts from the beginning (pre‑stim → coherent motion → post‑stim,
+    repeated N times).
 
-4.  FALLING EDGE detected →  the stimulus sequence is aborted
-    immediately; the protocol prints a summary and returns to the
-    waiting state so it can be re‑triggered without restarting the
-    Stytra application.
+4.  FALLING EDGE (voltage drops below 2.5V)  →  the stimulus sequence is
+    aborted immediately; the protocol prints a summary and saves all logs.
 
 INSTALL nidaqmx (choose ONE of the two commands below)
 ------------------------------------------------------
@@ -31,11 +30,18 @@ Download from:  https://www.ni.com/en/support/downloads/software-products/downlo
 
 CONFIGURE
 ---------
-Change the two constants near the top of this file to match your wiring:
+Change these constants near the top of this file to match your setup:
 
     DAQ_DEVICE_NAME   – e.g. "Dev1"   (run `nidaqmx.system.System().devices`
                                          to list detected devices)
-    DAQ_CHANNEL_PORT  – e.g. "port0/line0"
+    DAQ_AI_CHANNEL    – e.g. "ai0"    (analog input channel)
+    DAQ_THRESHOLD_V   – e.g. 2.5      (voltage threshold in volts)
+
+WIRING
+------
+Connect DIO5 (or other signal source) from the 2P computer to AI0 on Dev1.
+When the signal goes HIGH (>2.5V), the stimulus starts.
+When it goes LOW (<2.5V), the stimulus stops and logs are saved.
 
 Then set the desired vigor threshold and other protocol parameters in
 the VisualStim_dots.__init__ method as before.
@@ -58,14 +64,15 @@ from typing import Optional
 import json
 
 import nidaqmx
-from nidaqmx.constants import LineGrouping
 
 # ──────────────────────────────────────────────
-# USER‑CONFIGURABLE  –  edit these two lines
+# USER‑CONFIGURABLE  –  edit these lines
 # ──────────────────────────────────────────────
 DAQ_DEVICE_NAME  = "Dev1"          # e.g. "Dev1", "Dev2" …
-DAQ_CHANNEL_PORT = "port0/line0"   # e.g. "port0/line0"
-# Full channel name is built automatically: "Dev1/port0/line0"
+DAQ_AI_CHANNEL   = "ai0"           # Analog input channel (e.g. "ai0", "ai1")
+DAQ_THRESHOLD_V  = 2.5             # Voltage threshold for edge detection (V)
+# Rising edge  = voltage crosses above 2.5V
+# Falling edge = voltage drops below 2.5V
 
 # How often (seconds) the background thread checks the DAQ line.
 # 0.005 s  →  ~200 Hz polling  (plenty fast for behavioural paradigms)
@@ -137,16 +144,21 @@ class TrackedDotStim(ContinuousRandomDotKinematogram):
 
 class DAQEdgeMonitor:
     """
-    Polls a single digital‑input line and fires callbacks on edges.
+    Polls an analog input channel (AI0) and detects rising/falling edges
+    by checking if the voltage crosses above/below a threshold (2.5 V).
 
     Attributes / events that the protocol uses
     -------------------------------------------
-    rising_edge_event  : threading.Event  – set when a rising edge is seen.
-    falling_edge_event : threading.Event  – set when a falling edge is seen.
+    rising_edge_event  : threading.Event  – set when voltage crosses above 2.5V
+    falling_edge_event : threading.Event  – set when voltage drops below 2.5V
     """
 
-    def __init__(self, device: str, port_line: str, poll_interval: float = _POLL_INTERVAL):
-        self.channel_name  = f"{device}/{port_line}"
+    def __init__(self, device: str, ai_channel: str = "ai0",
+                 threshold: float = 2.5, poll_interval: float = _POLL_INTERVAL):
+        self.device        = device
+        self.ai_channel    = ai_channel
+        self.channel_name  = f"{device}/{ai_channel}"
+        self.threshold     = threshold
         self.poll_interval = poll_interval
 
         # Synchronisation primitives
@@ -154,8 +166,8 @@ class DAQEdgeMonitor:
         self.falling_edge_event = threading.Event()
 
         # Internal state
-        self._prev_state   = None        # last known line state (True / False)
-        self._stop_flag    = threading.Event()   # set to stop the polling thread
+        self._prev_above   = None        # was voltage above threshold last poll?
+        self._stop_flag    = threading.Event()
         self._thread       = None
 
     # ── public API ────────────────────────────────────────
@@ -165,10 +177,10 @@ class DAQEdgeMonitor:
         self._stop_flag.clear()
         self.rising_edge_event.clear()
         self.falling_edge_event.clear()
-        self._prev_state = None
+        self._prev_above = None
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
-        print(f"[DAQ] Monitoring {self.channel_name} …")
+        print(f"[DAQ] Monitoring {self.channel_name} (threshold {self.threshold}V) …")
 
     def stop(self):
         """Stop the background polling thread."""
@@ -187,30 +199,38 @@ class DAQEdgeMonitor:
 
     def _poll_loop(self):
         """
-        Opens a DAQmx task for the duration of the polling loop.
-        Reads one sample at a time; detects transitions by comparing
-        the current value to the previous one.
+        Opens a DAQmx task for analog input on AI0.
+        Reads voltage continuously; detects when it crosses above/below threshold.
         """
         try:
             with nidaqmx.Task() as task:
-                task.di_channels.add_di_chan(
+                task.ai_channels.add_ai_voltage_chan(
                     self.channel_name,
-                    line_grouping=LineGrouping.CHAN_PER_LINE
-                )
-                task.timing.cfg_samp_clk_timing(
-                    rate=1000,                          # internal clock rate (Hz)
-                    sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS
+                    terminal_config=nidaqmx.constants.TerminalConfiguration.RSE,
+                    min_val=-10.0,
+                    max_val=10.0
                 )
 
                 while not self._stop_flag.is_set():
                     try:
-                        # Read a single boolean sample (blocks up to poll_interval)
-                        current = task.read(
-                            number_of_samples_per_channel=1,
-                            timeout=self.poll_interval
-                        )
-                        # `current` is a list of bool when reading 1 channel
-                        state = bool(current[0]) if isinstance(current, list) else bool(current)
+                        voltage = task.read(timeout=self.poll_interval)
+                        above = (voltage > self.threshold)
+
+                        # Edge detection
+                        if self._prev_above is not None and above != self._prev_above:
+                            if above:
+                                # LOW → HIGH (voltage crossed above threshold)
+                                print(f"[DAQ] RISING:  voltage crossed above {self.threshold}V → {voltage:.3f}V")
+                                self.falling_edge_event.clear()
+                                self.rising_edge_event.set()
+                            else:
+                                # HIGH → LOW (voltage dropped below threshold)
+                                print(f"[DAQ] FALLING: voltage dropped below {self.threshold}V → {voltage:.3f}V")
+                                self.rising_edge_event.clear()
+                                self.falling_edge_event.set()
+
+                        self._prev_above = above
+
                     except nidaqmx.errors.WaitingForDataError:
                         # No new sample within timeout – that's fine, just loop
                         continue
@@ -219,22 +239,10 @@ class DAQEdgeMonitor:
                         time.sleep(self.poll_interval)
                         continue
 
-                    # Edge detection
-                    if self._prev_state is not None:
-                        if state and not self._prev_state:          # LOW → HIGH
-                            print("[DAQ] *** RISING EDGE detected ***")
-                            self.falling_edge_event.clear()
-                            self.rising_edge_event.set()
-                        elif not state and self._prev_state:        # HIGH → LOW
-                            print("[DAQ] *** FALLING EDGE detected ***")
-                            self.rising_edge_event.clear()
-                            self.falling_edge_event.set()
-
-                    self._prev_state = state
-
         except Exception as e:
             print(f"[DAQ] Fatal error in poll loop: {e}")
             traceback.print_exc()
+
 
 
 
@@ -377,7 +385,11 @@ class VisualStim_dots(Protocol):
         self.left_right                    = [0, 3]   # 0 = right, 3 = left
 
         # DAQ monitor instance (created once, reused across re‑triggers)
-        self._daq = DAQEdgeMonitor(DAQ_DEVICE_NAME, DAQ_CHANNEL_PORT)
+        self._daq = DAQEdgeMonitor(
+            device=DAQ_DEVICE_NAME,
+            ai_channel=DAQ_AI_CHANNEL,
+            threshold=DAQ_THRESHOLD_V
+        )
 
         # ── per‑trial bookkeeping (reset on every rising edge) ──
         self._rising_edge_time  = None   # datetime when rising edge arrived
@@ -427,7 +439,8 @@ class VisualStim_dots(Protocol):
                                           if self._falling_edge_time else None),
                 sequence_aborted       = self._sequence_aborted,
                 daq_device             = DAQ_DEVICE_NAME,
-                daq_channel            = DAQ_CHANNEL_PORT,
+                daq_ai_channel         = DAQ_AI_CHANNEL,
+                daq_threshold_v        = DAQ_THRESHOLD_V,
             )
 
             # ── flush behaviour_log + stim_log + metadata ───────
