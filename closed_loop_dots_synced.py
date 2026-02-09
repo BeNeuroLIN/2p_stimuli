@@ -1,0 +1,238 @@
+import numpy as np
+from stytra import Stytra, Protocol
+import pandas as pd
+from stytra.stimulation.stimuli.kinematograms import ContinuousRandomDotKinematogram
+from stytra.stimulation.stimuli.visual import Pause
+from lightparam import Param
+from PyQt5.QtCore import QRect
+from PyQt5.QtGui import QBrush, QColor
+from pypylon import pylon
+import random
+import time
+import traceback
+
+# -----------------------
+# NI DAQ
+# -----------------------
+import nidaqmx
+from nidaqmx.constants import TerminalConfiguration
+
+DEVICE_NAME = "Dev1"
+AI_CHANNEL = "ai0"
+THRESHOLD = 2.5
+POLL_RATE = 0.01  # 100 Hz
+full_channel = f"{DEVICE_NAME}/{AI_CHANNEL}"
+
+# -----------------------
+# Stytra checks / prints (kept)
+# -----------------------
+import stytra
+print(stytra.__file__)
+
+from stytra.hardware.video.cameras import camera_class_dict
+print(sorted(camera_class_dict.keys()))
+
+from pypylon import pylon
+print(pylon.TlFactory.GetInstance().EnumerateDevices())
+
+# -----------------------
+# Trigger for Stytra (waits for rising edge on Dev1/ai0)
+# -----------------------
+from stytra.triggering import Trigger
+
+class NIRisingEdgeTrigger(Trigger):
+    def __init__(self, channel, threshold=2.5, poll_rate=0.01):
+        super().__init__()
+        self.channel = channel
+        self.threshold = float(threshold)
+        self.poll_rate = float(poll_rate)
+
+        self._task = None
+        self._prev_above = None
+
+    def _ensure_task(self):
+        if self._task is not None:
+            return
+
+        task = nidaqmx.Task()
+        task.ai_channels.add_ai_voltage_chan(
+            self.channel,
+            terminal_config=TerminalConfiguration.RSE,
+            min_val=-10.0,
+            max_val=10.0
+        )
+        self._task = task
+
+        print(
+            f"[Trigger] Armed on {self.channel}: waiting for rising above {self.threshold}V "
+            f"(poll {1.0/self.poll_rate:.0f} Hz)..."
+        )
+
+    def check_trigger(self):
+        # Called repeatedly in the Trigger process; return True to start the protocol
+        self._ensure_task()
+
+        voltage = self._task.read()
+        above = (voltage > self.threshold)
+
+        if self._prev_above is not None and above != self._prev_above:
+            if above:
+                print(f"RISING:  voltage crossed above {self.threshold}V → {voltage:.3f}V")
+                return True
+            else:
+                print(f"FALLING: voltage dropped below {self.threshold}V → {voltage:.3f}V")
+
+        self._prev_above = above
+        time.sleep(self.poll_rate)
+        return False
+
+    def __del__(self):
+        # Best-effort cleanup
+        try:
+            if self._task is not None:
+                self._task.close()
+        except Exception:
+            pass
+
+
+# -----------------------
+# Your stimulus classes (unchanged)
+# -----------------------
+class VigorResponsiveDotStim(ContinuousRandomDotKinematogram):
+    def __init__(self, *args, vigor_threshold=-5.0, original_coherence=1.0, **kwargs):
+        self.vigor_threshold = vigor_threshold
+        self.original_coherence = original_coherence
+        self.coherence_dropped = False
+        self.current_coherence = original_coherence
+        super().__init__(*args, **kwargs)
+
+    def update(self):
+        if hasattr(self, '_experiment') and self._experiment is not None:
+            if hasattr(self._experiment, 'estimator') and self._experiment.estimator is not None:
+                try:
+                    vigor = self._experiment.estimator.get_velocity()
+
+                    if vigor is not None and vigor < -5.0:
+                        print(f"Current vigor: {vigor:.3f}")
+
+                    if vigor is not None and vigor < self.vigor_threshold:
+                        if not self.coherence_dropped:
+                            self.df_param.loc[:, 'coherence'] = 0
+                            self.coherence_dropped = True
+                            self.current_coherence = 0.0
+                            print(
+                                f">>> VIGOR THRESHOLD EXCEEDED ({vigor:.2f} < {self.vigor_threshold}). "
+                                f"COHERENCE DROPPED TO 0. <<<"
+                            )
+
+                    if hasattr(self._experiment, 'dynamic_log'):
+                        self._experiment.dynamic_log.update_param('current_coherence', self.current_coherence)
+
+                except Exception as e:
+                    print(f"Error getting vigor: {e}")
+
+        super().update()
+
+
+class TrackedDotStim(ContinuousRandomDotKinematogram):
+    def __init__(self, *args, tracked_coherence=0.0, **kwargs):
+        self.coherence_value = tracked_coherence
+        super().__init__(*args, **kwargs)
+
+    def update(self):
+        if hasattr(self, '_experiment') and self._experiment is not None:
+            if hasattr(self._experiment, 'dynamic_log'):
+                self._experiment.dynamic_log.update_param('current_coherence', self.coherence_value)
+        super().update()
+
+
+class VisualStim_dots(Protocol):
+    name = "VisualStim_dots"
+
+    stytra_config = dict(
+        tracking=dict(embedded=True, method="tail", estimator="vigor"),
+        camera=dict(camera=dict(type="basler", cam_idx=0)),
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.number_of_repeats = Param(1, limits=None)
+        self.duration_of_stimulus_in_seconds = Param(10, limits=None)
+        self.pause_before_stimulus = Param(0, limits=None)
+        self.pause_after_stimulus = Param(0, limits=None)
+        self.vigor_threshold = Param(-1.0, limits=(-100, 100))
+        self.left_right = [0, 3]
+
+    def get_stim_sequence(self):
+        stimuli = []
+
+        for i in range(self.number_of_repeats):
+            stimuli.append(
+                TrackedDotStim(
+                    dot_density=0.3,
+                    dot_radius=0.6,
+                    df_param=pd.DataFrame(
+                        dict(
+                            t=[30],
+                            coherence=[0],
+                            frozen=[0],
+                            theta_relative=[random.choice(self.left_right)]
+                        )
+                    ),
+                    tracked_coherence=0.0
+                ),
+            )
+
+            vigor_stim = VigorResponsiveDotStim(
+                dot_density=0.3,
+                dot_radius=0.6,
+                df_param=pd.DataFrame(
+                    dict(
+                        t=[40],
+                        coherence=[1],
+                        frozen=[0],
+                        theta_relative=[random.choice(self.left_right)]
+                    )
+                ),
+                vigor_threshold=float(self.vigor_threshold),
+                original_coherence=1.0
+            )
+            stimuli.append(vigor_stim)
+
+            stimuli.append(
+                TrackedDotStim(
+                    dot_density=0.3,
+                    dot_radius=0.6,
+                    df_param=pd.DataFrame(
+                        dict(
+                            t=[10],
+                            coherence=[0],
+                            frozen=[0],
+                            theta_relative=[random.choice(self.left_right)]
+                        )
+                    ),
+                    tracked_coherence=0.0
+                ),
+            )
+
+        return stimuli
+
+
+if __name__ == "__main__":
+    try:
+        # Create the trigger (Dev1/ai0 rising above 2.5V)
+        trigger = NIRisingEdgeTrigger(full_channel, threshold=THRESHOLD, poll_rate=POLL_RATE)
+
+        # Start Stytra immediately.
+        # IMPORTANT: In the GUI, tick "wait for trigger", then press Play.
+        st = Stytra(
+            protocol=VisualStim_dots(),
+            camera=dict(type="basler", cam_idx=0),
+            stim_plot=True,
+            scope_triggering=trigger,   # <-- this is the key
+        )
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    except Exception as e:
+        print(f"ERROR: {e}")
