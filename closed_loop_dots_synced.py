@@ -1,3 +1,11 @@
+'''
+author: paula.pflitsch@lin-magdeburg.de
+
+This code contains a closed-loop moving dot stimulus.
+It can be started with the stytra trigger function.
+## The "Wait for trigger" option in stytra needs to be ticked.
+
+'''
 import numpy as np
 from stytra import Stytra, Protocol
 import pandas as pd
@@ -40,7 +48,12 @@ print(pylon.TlFactory.GetInstance().EnumerateDevices())
 # -----------------------
 from stytra.triggering import Trigger
 
-class NIRisingEdgeTrigger(Trigger):
+from stytra.triggering import Trigger
+import nidaqmx
+from nidaqmx.constants import TerminalConfiguration
+import time
+
+class NIRiseFallTrigger(Trigger):
     def __init__(self, channel, threshold=2.5, poll_rate=0.01):
         super().__init__()
         self.channel = channel
@@ -49,6 +62,7 @@ class NIRisingEdgeTrigger(Trigger):
 
         self._task = None
         self._prev_above = None
+        self._started = False  # tracks whether experiment has started
 
     def _ensure_task(self):
         if self._task is not None:
@@ -59,25 +73,29 @@ class NIRisingEdgeTrigger(Trigger):
             self.channel,
             terminal_config=TerminalConfiguration.RSE,
             min_val=-10.0,
-            max_val=10.0
+            max_val=10.0,
         )
         self._task = task
 
         print(
-            f"[Trigger] Armed on {self.channel}: waiting for rising above {self.threshold}V "
-            f"(poll {1.0/self.poll_rate:.0f} Hz)..."
+            f"[Trigger] Armed on {self.channel}: "
+            f"start > {self.threshold}V, stop < {self.threshold}V"
         )
 
     def check_trigger(self):
-        # Called repeatedly in the Trigger process; return True to start the protocol
+        """
+        Called repeatedly before experiment starts.
+        Return True to START the experiment.
+        """
         self._ensure_task()
 
         voltage = self._task.read()
-        above = (voltage > self.threshold)
+        above = voltage > self.threshold
 
         if self._prev_above is not None and above != self._prev_above:
             if above:
                 print(f"RISING:  voltage crossed above {self.threshold}V → {voltage:.3f}V")
+                self._started = True
                 return True
             else:
                 print(f"FALLING: voltage dropped below {self.threshold}V → {voltage:.3f}V")
@@ -86,8 +104,25 @@ class NIRisingEdgeTrigger(Trigger):
         time.sleep(self.poll_rate)
         return False
 
+    def stop_condition(self):
+        """
+        Called repeatedly *during* the experiment.
+        Return True to STOP recording + protocol.
+        """
+        if not self._started:
+            return False
+
+        voltage = self._task.read()
+        above = voltage > self.threshold
+
+        if not above:
+            print(f"STOP:    voltage fell below {self.threshold}V → {voltage:.3f}V")
+            return True
+
+        time.sleep(self.poll_rate)
+        return False
+
     def __del__(self):
-        # Best-effort cleanup
         try:
             if self._task is not None:
                 self._task.close()
@@ -219,20 +254,15 @@ class VisualStim_dots(Protocol):
 
 
 if __name__ == "__main__":
-    try:
-        # Create the trigger (Dev1/ai0 rising above 2.5V)
-        trigger = NIRisingEdgeTrigger(full_channel, threshold=THRESHOLD, poll_rate=POLL_RATE)
+    trigger = NIRiseFallTrigger(
+        channel=full_channel,
+        threshold=THRESHOLD,
+        poll_rate=POLL_RATE,
+    )
 
-        # Start Stytra immediately.
-        # IMPORTANT: In the GUI, tick "wait for trigger", then press Play.
-        st = Stytra(
-            protocol=VisualStim_dots(),
-            camera=dict(type="basler", cam_idx=0),
-            stim_plot=True,
-            scope_triggering=trigger,   # <-- this is the key
-        )
-
-    except KeyboardInterrupt:
-        print("\nStopped.")
-    except Exception as e:
-        print(f"ERROR: {e}")
+    st = Stytra(
+        protocol=VisualStim_dots(),
+        camera=dict(type="basler", cam_idx=0),
+        stim_plot=True,
+        scope_triggering=trigger,
+    )
