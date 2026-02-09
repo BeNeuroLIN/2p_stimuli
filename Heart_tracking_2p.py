@@ -49,6 +49,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+def today_yyyymmdd() -> str:
+    return datetime.now().strftime("%Y%m%d")
 
 class FLIRCameraController:
     """
@@ -80,8 +82,11 @@ class FLIRCameraController:
         self.running = True
 
         # Video settings
-        self.fps = 30
+        self.fps = 40
         self.codec = cv2.VideoWriter_fourcc(*'XVID')
+
+        #trigger
+        self.waiting_for_trigger = False
 
     def _get_next_recording_number(self):
         """
@@ -210,85 +215,84 @@ class FLIRCameraController:
             print(f"Error configuring camera: {ex}")
             return False
 
-    def _configure_trigger_mode(self, enable=True):
+    def _configure_trigger_mode(self, enable=True, line="Line2", selector="AcquisitionStart"):
         """
         Configure hardware trigger mode.
-
-        Args:
-            enable: True to enable trigger mode, False to disable
+        enable=True  -> triggered
+        enable=False -> free-run
         """
         try:
             # Ensure camera is not acquiring
-            if self.cam.IsStreaming():
-                self.cam.EndAcquisition()
+            try:
+                if self.cam.IsStreaming():
+                    self.cam.EndAcquisition()
+            except Exception:
+                pass
+
+            node_trigger_mode = PySpin.CEnumerationPtr(self.nodemap.GetNode('TriggerMode'))
+            if not PySpin.IsAvailable(node_trigger_mode) or not PySpin.IsWritable(node_trigger_mode):
+                print("Unable to access TriggerMode")
+                return False
+
+            # Always turn trigger OFF before changing other trigger settings
+            node_trigger_mode_off = node_trigger_mode.GetEntryByName('Off')
+            node_trigger_mode.SetIntValue(node_trigger_mode_off.GetValue())
 
             if enable:
-                # Set trigger mode to On
-                node_trigger_mode = PySpin.CEnumerationPtr(
-                    self.nodemap.GetNode('TriggerMode'))
-                if not PySpin.IsAvailable(node_trigger_mode) or \
-                        not PySpin.IsWritable(node_trigger_mode):
-                    print("Unable to enable trigger mode")
+                # TriggerSelector (FrameStart vs AcquisitionStart)
+                node_trigger_selector = PySpin.CEnumerationPtr(self.nodemap.GetNode('TriggerSelector'))
+                if PySpin.IsAvailable(node_trigger_selector) and PySpin.IsWritable(node_trigger_selector):
+                    entry = node_trigger_selector.GetEntryByName(selector)
+                    if PySpin.IsAvailable(entry) and PySpin.IsReadable(entry):
+                        node_trigger_selector.SetIntValue(entry.GetValue())
+                    else:
+                        print(f"TriggerSelector entry '{selector}' not available; leaving default.")
+                else:
+                    print("TriggerSelector not available on this camera (OK).")
+
+                # TriggerSource (Line2)
+                node_trigger_source = PySpin.CEnumerationPtr(self.nodemap.GetNode('TriggerSource'))
+                if PySpin.IsAvailable(node_trigger_source) and PySpin.IsWritable(node_trigger_source):
+                    entry = node_trigger_source.GetEntryByName(line)
+                    if PySpin.IsAvailable(entry) and PySpin.IsReadable(entry):
+                        node_trigger_source.SetIntValue(entry.GetValue())
+                    else:
+                        print(f"TriggerSource '{line}' not available.")
+                        return False
+                else:
+                    print("TriggerSource not available.")
                     return False
 
+                # TriggerActivation (RisingEdge)
+                node_trigger_activation = PySpin.CEnumerationPtr(self.nodemap.GetNode('TriggerActivation'))
+                if PySpin.IsAvailable(node_trigger_activation) and PySpin.IsWritable(node_trigger_activation):
+                    entry = node_trigger_activation.GetEntryByName('RisingEdge')
+                    if PySpin.IsAvailable(entry) and PySpin.IsReadable(entry):
+                        node_trigger_activation.SetIntValue(entry.GetValue())
+                else:
+                    print("TriggerActivation not available (OK).")
+
+                # Configure the physical line as input (if supported)
+                node_line_selector = PySpin.CEnumerationPtr(self.nodemap.GetNode('LineSelector'))
+                if PySpin.IsAvailable(node_line_selector) and PySpin.IsWritable(node_line_selector):
+                    entry = node_line_selector.GetEntryByName(line)
+                    if PySpin.IsAvailable(entry) and PySpin.IsReadable(entry):
+                        node_line_selector.SetIntValue(entry.GetValue())
+
+                        node_line_mode = PySpin.CEnumerationPtr(self.nodemap.GetNode('LineMode'))
+                        if PySpin.IsAvailable(node_line_mode) and PySpin.IsWritable(node_line_mode):
+                            entry2 = node_line_mode.GetEntryByName('Input')
+                            if PySpin.IsAvailable(entry2) and PySpin.IsReadable(entry2):
+                                node_line_mode.SetIntValue(entry2.GetValue())
+
+                # Finally turn trigger ON
                 node_trigger_mode_on = node_trigger_mode.GetEntryByName('On')
-                trigger_mode_on = node_trigger_mode_on.GetValue()
-                node_trigger_mode.SetIntValue(trigger_mode_on)
+                node_trigger_mode.SetIntValue(node_trigger_mode_on.GetValue())
 
-                # Set trigger source to Line0 (hardware trigger input)
-                node_trigger_source = PySpin.CEnumerationPtr(
-                    self.nodemap.GetNode('TriggerSource'))
-                if PySpin.IsAvailable(node_trigger_source) and \
-                        PySpin.IsWritable(node_trigger_source):
-                    node_trigger_source_line0 = node_trigger_source.GetEntryByName('Line0')
-                    if PySpin.IsAvailable(node_trigger_source_line0) and \
-                            PySpin.IsReadable(node_trigger_source_line0):
-                        trigger_source_line0 = node_trigger_source_line0.GetValue()
-                        node_trigger_source.SetIntValue(trigger_source_line0)
-
-                # Set trigger activation to RisingEdge
-                node_trigger_activation = PySpin.CEnumerationPtr(
-                    self.nodemap.GetNode('TriggerActivation'))
-                if PySpin.IsAvailable(node_trigger_activation) and \
-                        PySpin.IsWritable(node_trigger_activation):
-                    node_trigger_activation_rising = node_trigger_activation.GetEntryByName('RisingEdge')
-                    if PySpin.IsAvailable(node_trigger_activation_rising) and \
-                            PySpin.IsReadable(node_trigger_activation_rising):
-                        trigger_activation_rising = node_trigger_activation_rising.GetValue()
-                        node_trigger_activation.SetIntValue(trigger_activation_rising)
-
-                # Configure Line0 as input (if available)
-                node_line_selector = PySpin.CEnumerationPtr(
-                    self.nodemap.GetNode('LineSelector'))
-                if PySpin.IsAvailable(node_line_selector) and \
-                        PySpin.IsWritable(node_line_selector):
-                    node_line_selector_line0 = node_line_selector.GetEntryByName('Line0')
-                    if PySpin.IsAvailable(node_line_selector_line0):
-                        line_selector_line0 = node_line_selector_line0.GetValue()
-                        node_line_selector.SetIntValue(line_selector_line0)
-
-                        # Set line mode to input
-                        node_line_mode = PySpin.CEnumerationPtr(
-                            self.nodemap.GetNode('LineMode'))
-                        if PySpin.IsAvailable(node_line_mode) and \
-                                PySpin.IsWritable(node_line_mode):
-                            node_line_mode_input = node_line_mode.GetEntryByName('Input')
-                            if PySpin.IsAvailable(node_line_mode_input):
-                                line_mode_input = node_line_mode_input.GetValue()
-                                node_line_mode.SetIntValue(line_mode_input)
-
-                print("Trigger mode ENABLED (Rising edge, Line0, 2.5V threshold)")
+                print(f"Trigger ENABLED: {selector}, {line}, RisingEdge")
 
             else:
-                # Set trigger mode to Off
-                node_trigger_mode = PySpin.CEnumerationPtr(
-                    self.nodemap.GetNode('TriggerMode'))
-                if PySpin.IsAvailable(node_trigger_mode) and \
-                        PySpin.IsWritable(node_trigger_mode):
-                    node_trigger_mode_off = node_trigger_mode.GetEntryByName('Off')
-                    trigger_mode_off = node_trigger_mode_off.GetValue()
-                    node_trigger_mode.SetIntValue(trigger_mode_off)
-                    print("Trigger mode DISABLED")
+                print("Trigger DISABLED (free-run)")
 
             return True
 
@@ -297,43 +301,33 @@ class FLIRCameraController:
             return False
 
     def switch_mode(self, new_mode):
-        """
-        Switch between free-run and triggered modes.
-
-        Args:
-            new_mode: "free-run" or "triggered"
-        """
         if new_mode not in ["free-run", "triggered"]:
             print(f"Invalid mode: {new_mode}")
             return False
-
         if new_mode == self.mode:
             print(f"Already in {new_mode} mode")
             return True
 
         print(f"Switching from {self.mode} to {new_mode} mode...")
 
-        # Stop recording if active
         if self.recording:
             self.stop_recording()
 
-        # Stop acquisition
         if self.cam and self.cam.IsStreaming():
             self.cam.EndAcquisition()
 
-        # Update mode
         self.mode = new_mode
 
-        # Reconfigure trigger
         if new_mode == "triggered":
-            self._configure_trigger_mode(enable=True)
+            ok = self._configure_trigger_mode(enable=True, line="Line2", selector="AcquisitionStart")
         else:
-            self._configure_trigger_mode(enable=False)
+            ok = self._configure_trigger_mode(enable=False)
 
-        # Restart acquisition
-        if self.cam:
-            self.cam.BeginAcquisition()
+        if not ok:
+            print("Failed to switch mode.")
+            return False
 
+        self.cam.BeginAcquisition()
         print(f"Switched to {new_mode} mode successfully")
         return True
 
@@ -345,7 +339,8 @@ class FLIRCameraController:
 
         try:
             # Get the first image to determine frame size
-            image_result = self.cam.GetNextImage(1000)
+            timeout = 10 if (self.mode == "triggered" and self.waiting_for_trigger) else 1000
+            image_result = self.cam.GetNextImage(timeout)
 
             if image_result.IsIncomplete():
                 print("Image incomplete")
@@ -378,9 +373,15 @@ class FLIRCameraController:
             print(f"Started recording: {filename}")
             return True
 
+
         except PySpin.SpinnakerException as ex:
-            print(f"Error starting recording: {ex}")
-            return False
+            # very common in triggered mode when no trigger has happened yet
+            if self.mode == "triggered" and self.waiting_for_trigger:
+                # keep UI alive
+                key = cv2.waitKey(1) & 0xFF
+                continue
+            print(f"Error: {ex}")
+            continue
 
     def stop_recording(self):
         """Stop recording video."""
@@ -464,17 +465,13 @@ class FLIRCameraController:
                             self.start_recording()
                     elif key == ord('t'):
                         self.switch_mode("triggered")
-                        if not self.recording:
-                            # Auto-start recording in triggered mode
-                            self.start_recording()
+                        self.waiting_for_trigger = True
+                        print("Triggered mode armed. Waiting for first trigger/frame...")
                     elif key == ord('f'):
                         self.switch_mode("free-run")
+                        self.waiting_for_trigger = False
 
-                    # In triggered mode, auto-record on trigger
-                    if self.mode == "triggered" and not self.recording:
-                        # The camera will automatically capture on trigger
-                        # Start recording on first triggered frame
-                        self.start_recording()
+
 
                 except PySpin.SpinnakerException as ex:
                     print(f"Error: {ex}")
@@ -521,6 +518,12 @@ def main():
     """Main function."""
     import argparse
 
+    # If we are armed in triggered mode and first frame arrived, start recording NOW
+    if self.mode == "triggered" and self.waiting_for_trigger and not self.recording:
+        self.start_recording()
+        self.waiting_for_trigger = False
+
+
     parser = argparse.ArgumentParser(
         description='FLIR Camera Control with Free-Run and Triggered Modes')
     parser.add_argument('--output-dir', '-o', default='./recordings',
@@ -536,9 +539,16 @@ def main():
     args = parser.parse_args()
 
     # Create controller
+    # Create date folder inside output-dir
+    date_str = today_yyyymmdd()
+    dated_output_dir = Path(args.output_dir) / date_str
+
+    # Force base filename to be like 20260209_
+    base_filename = f"{date_str}_"
+
     controller = FLIRCameraController(
-        output_dir=args.output_dir,
-        base_filename=args.base_filename
+        output_dir=str(dated_output_dir),
+        base_filename=base_filename
     )
     controller.fps = args.fps
     controller.mode = args.mode
@@ -562,6 +572,12 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+    if self.mode == "triggered" and self.waiting_for_trigger and not self.recording:
+        self.start_recording()
+        self.waiting_for_trigger = False
+
+
 
 
 
