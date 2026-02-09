@@ -22,8 +22,10 @@ import traceback
 # -----------------------
 # NI DAQ
 # -----------------------
+from stytra.triggering import Trigger
 import nidaqmx
 from nidaqmx.constants import TerminalConfiguration
+import time
 
 DEVICE_NAME = "Dev1"
 AI_CHANNEL = "ai0"
@@ -62,20 +64,20 @@ class NIRiseFallTrigger(Trigger):
 
         self._task = None
         self._prev_above = None
-        self._started = False  # tracks whether experiment has started
+        self._armed = False
+        self._stopped = False
 
     def _ensure_task(self):
         if self._task is not None:
             return
 
-        task = nidaqmx.Task()
-        task.ai_channels.add_ai_voltage_chan(
+        self._task = nidaqmx.Task()
+        self._task.ai_channels.add_ai_voltage_chan(
             self.channel,
             terminal_config=TerminalConfiguration.RSE,
             min_val=-10.0,
             max_val=10.0,
         )
-        self._task = task
 
         print(
             f"[Trigger] Armed on {self.channel}: "
@@ -84,8 +86,8 @@ class NIRiseFallTrigger(Trigger):
 
     def check_trigger(self):
         """
-        Called repeatedly before experiment starts.
-        Return True to START the experiment.
+        Called BEFORE experiment starts.
+        Return True to start experiment + recording.
         """
         self._ensure_task()
 
@@ -95,7 +97,8 @@ class NIRiseFallTrigger(Trigger):
         if self._prev_above is not None and above != self._prev_above:
             if above:
                 print(f"RISING:  voltage crossed above {self.threshold}V → {voltage:.3f}V")
-                self._started = True
+                self._armed = True
+                self._prev_above = above
                 return True
             else:
                 print(f"FALLING: voltage dropped below {self.threshold}V → {voltage:.3f}V")
@@ -104,23 +107,34 @@ class NIRiseFallTrigger(Trigger):
         time.sleep(self.poll_rate)
         return False
 
-    def stop_condition(self):
+    def on_start(self):
         """
-        Called repeatedly *during* the experiment.
-        Return True to STOP recording + protocol.
+        Called once experiment actually starts.
         """
-        if not self._started:
-            return False
+        print("[Trigger] Experiment started, monitoring for stop trigger")
+
+    def update(self):
+        """
+        Called REPEATEDLY during the experiment.
+        This is where we implement a true 'Stop recording'.
+        """
+        if not self._armed or self._stopped:
+            return
 
         voltage = self._task.read()
         above = voltage > self.threshold
 
         if not above:
             print(f"STOP:    voltage fell below {self.threshold}V → {voltage:.3f}V")
-            return True
+
+            # EXACTLY the same as pressing the Stop button
+            if self.experiment is not None:
+                self.experiment.stop_recording()
+                self.experiment.stop()
+
+            self._stopped = True
 
         time.sleep(self.poll_rate)
-        return False
 
     def __del__(self):
         try:
