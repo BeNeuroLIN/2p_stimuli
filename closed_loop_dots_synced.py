@@ -55,7 +55,15 @@ print(pylon.TlFactory.GetInstance().EnumerateDevices())
 # Trigger for Stytra (waits for rising edge on Dev1/ai0)
 # -----------------------
 
+# Drop-in replacement trigger class (put this where your other trigger was)
+
 class NIRiseFallTrigger(Trigger):
+    """
+    Start when Dev1/ai0 rises above threshold (check_trigger -> returns True).
+    During experiment, monitor voltage in update(); when it falls below threshold
+    we schedule the exact same calls as pressing the Stop button, but
+    scheduled on the Qt main thread using QTimer.singleShot(0, ...).
+    """
     def __init__(self, channel, threshold=2.5, poll_rate=0.01):
         super().__init__()
         self.channel = channel
@@ -70,7 +78,6 @@ class NIRiseFallTrigger(Trigger):
     def _ensure_task(self):
         if self._task is not None:
             return
-
         self._task = nidaqmx.Task()
         self._task.ai_channels.add_ai_voltage_chan(
             self.channel,
@@ -78,16 +85,13 @@ class NIRiseFallTrigger(Trigger):
             min_val=-10.0,
             max_val=10.0,
         )
-
         print(
-            f"[Trigger] Armed on {self.channel}: "
-            f"start > {self.threshold}V, stop < {self.threshold}V"
+            f"[Trigger] Armed on {self.channel}: start > {self.threshold}V, stop < {self.threshold}V"
         )
 
     def check_trigger(self):
         """
-        Called BEFORE experiment starts.
-        Return True to start experiment + recording.
+        Called repeatedly BEFORE experiment starts. Return True to start.
         """
         self._ensure_task()
 
@@ -109,29 +113,52 @@ class NIRiseFallTrigger(Trigger):
 
     def on_start(self):
         """
-        Called once experiment actually starts.
+        Called once experiment starts.
         """
         print("[Trigger] Experiment started, monitoring for stop trigger")
 
+    def _do_stop_on_main_thread(self):
+        """
+        This runs on the Qt main thread (because we call it via QTimer.singleShot).
+        Perform the same actions as the GUI Stop: stop_recording() then stop().
+        """
+        try:
+            if self.experiment is not None:
+                print("[Trigger] Scheduling stop: calling experiment.stop_recording() and experiment.stop() on main thread")
+                # these are the calls the GUI Stop uses
+                try:
+                    self.experiment.stop_recording()
+                except Exception as e:
+                    # still proceed to stop; log the exception
+                    print(f"[Trigger] Exception in stop_recording(): {e}")
+                try:
+                    self.experiment.stop()
+                except Exception as e:
+                    print(f"[Trigger] Exception in stop(): {e}")
+        except Exception as e:
+            print(f"[Trigger] Unexpected error when trying to stop: {e}")
+
     def update(self):
         """
-        Called REPEATEDLY during the experiment.
-        This is where we implement a true 'Stop recording'.
+        Called repeatedly DURING experiment. When voltage falls below threshold,
+        schedule the GUI-thread stop (via QTimer.singleShot) and mark stopped.
         """
         if not self._armed or self._stopped:
             return
 
-        voltage = self._task.read()
+        try:
+            voltage = self._task.read()
+        except Exception as e:
+            print(f"[Trigger] Error reading DAQ during update(): {e}")
+            time.sleep(self.poll_rate)
+            return
+
         above = voltage > self.threshold
 
         if not above:
             print(f"STOP:    voltage fell below {self.threshold}V → {voltage:.3f}V")
-
-            # EXACTLY the same as pressing the Stop button
-            if self.experiment is not None:
-                self.experiment.stop_recording()
-                self.experiment.stop()
-
+            # Schedule stop on main Qt thread (0 ms -> run as soon as control returns to event loop)
+            QTimer.singleShot(0, self._do_stop_on_main_thread)
             self._stopped = True
 
         time.sleep(self.poll_rate)
