@@ -57,12 +57,43 @@ print(pylon.TlFactory.GetInstance().EnumerateDevices())
 
 # Drop-in replacement trigger class (put this where your other trigger was)
 
+class _Stopper(QObject):
+    """
+    Helper QObject that runs on the Qt/main thread and performs the actual stop calls.
+    We emit 'stop_req' from the trigger thread; the connected slot executes in the
+    Qt thread and calls Stytra's stop_recording/stop methods.
+    """
+    stop_req = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.stop_req.connect(self._do_stop, type=0)  # default connection; queued across threads
+
+    @pyqtSlot()
+    def _do_stop(self):
+        try:
+            exp = getattr(self, "experiment_obj", None)
+            if exp is None:
+                print("[Stopper] No experiment object found on stopper.")
+                return
+            print("[Stopper] Calling experiment.stop_recording() on main thread")
+            try:
+                exp.stop_recording()
+            except Exception as e:
+                print(f"[Stopper] Exception in stop_recording(): {e}")
+            print("[Stopper] Calling experiment.stop() on main thread")
+            try:
+                exp.stop()
+            except Exception as e:
+                print(f"[Stopper] Exception in stop(): {e}")
+        except Exception as e:
+            print(f"[Stopper] Unexpected error in _do_stop(): {e}")
+
+
 class NIRiseFallTrigger(Trigger):
     """
-    Start when Dev1/ai0 rises above threshold (check_trigger -> returns True).
-    During experiment, monitor voltage in update(); when it falls below threshold
-    we schedule the exact same calls as pressing the Stop button, but
-    scheduled on the Qt main thread using QTimer.singleShot(0, ...).
+    Start on rising edge (> threshold) and stop recording on falling edge (< threshold).
+    Uses a helper Qt QObject with a signal to ensure the stop calls run on the main Qt thread.
     """
     def __init__(self, channel, threshold=2.5, poll_rate=0.01):
         super().__init__()
@@ -75,6 +106,9 @@ class NIRiseFallTrigger(Trigger):
         self._armed = False
         self._stopped = False
 
+        # stopper will be created in on_start (so we can attach experiment)
+        self._stopper = None
+
     def _ensure_task(self):
         if self._task is not None:
             return
@@ -85,17 +119,20 @@ class NIRiseFallTrigger(Trigger):
             min_val=-10.0,
             max_val=10.0,
         )
-        print(
-            f"[Trigger] Armed on {self.channel}: start > {self.threshold}V, stop < {self.threshold}V"
-        )
+        print(f"[Trigger] Armed on {self.channel}: start > {self.threshold}V, stop < {self.threshold}V")
 
     def check_trigger(self):
         """
-        Called repeatedly BEFORE experiment starts. Return True to start.
+        Called repeatedly BEFORE experiment starts. Return True to start the experiment.
         """
-        self._ensure_task()
+        try:
+            self._ensure_task()
+            voltage = self._task.read()
+        except Exception as e:
+            print(f"[Trigger] Error reading DAQ in check_trigger(): {e}")
+            time.sleep(self.poll_rate)
+            return False
 
-        voltage = self._task.read()
         above = voltage > self.threshold
 
         if self._prev_above is not None and above != self._prev_above:
@@ -105,7 +142,7 @@ class NIRiseFallTrigger(Trigger):
                 self._prev_above = above
                 return True
             else:
-                print(f"FALLING: voltage dropped below {self.threshold}V → {voltage:.3f}V")
+                print(f"FALLING (pre-start): voltage dropped below {self.threshold}V → {voltage:.3f}V")
 
         self._prev_above = above
         time.sleep(self.poll_rate)
@@ -113,37 +150,28 @@ class NIRiseFallTrigger(Trigger):
 
     def on_start(self):
         """
-        Called once experiment starts.
+        Called once the experiment actually starts. Create the stopper and attach experiment.
         """
-        print("[Trigger] Experiment started, monitoring for stop trigger")
-
-    def _do_stop_on_main_thread(self):
-        """
-        This runs on the Qt main thread (because we call it via QTimer.singleShot).
-        Perform the same actions as the GUI Stop: stop_recording() then stop().
-        """
+        print("[Trigger] Experiment started, creating stopper and monitoring for stop trigger")
+        # Create stopper and attach the experiment object so the stopper can call stop methods.
         try:
-            if self.experiment is not None:
-                print("[Trigger] Scheduling stop: calling experiment.stop_recording() and experiment.stop() on main thread")
-                # these are the calls the GUI Stop uses
-                try:
-                    self.experiment.stop_recording()
-                except Exception as e:
-                    # still proceed to stop; log the exception
-                    print(f"[Trigger] Exception in stop_recording(): {e}")
-                try:
-                    self.experiment.stop()
-                except Exception as e:
-                    print(f"[Trigger] Exception in stop(): {e}")
+            self._stopper = _Stopper()
+            # attach experiment object for use by the stopper
+            try:
+                # self.experiment should be available (Stytra sets this on the trigger)
+                self._stopper.experiment_obj = self.experiment
+                print("[Trigger] Stopper attached to experiment.")
+            except Exception as e:
+                print(f"[Trigger] Could not attach experiment to stopper: {e}")
         except Exception as e:
-            print(f"[Trigger] Unexpected error when trying to stop: {e}")
+            print(f"[Trigger] Error creating stopper: {e}")
 
     def update(self):
         """
-        Called repeatedly DURING experiment. When voltage falls below threshold,
-        schedule the GUI-thread stop (via QTimer.singleShot) and mark stopped.
+        Called repeatedly DURING the experiment. On falling edge, request stopper to execute stop on main thread.
         """
         if not self._armed or self._stopped:
+            # nothing to do
             return
 
         try:
@@ -157,8 +185,28 @@ class NIRiseFallTrigger(Trigger):
 
         if not above:
             print(f"STOP:    voltage fell below {self.threshold}V → {voltage:.3f}V")
-            # Schedule stop on main Qt thread (0 ms -> run as soon as control returns to event loop)
-            QTimer.singleShot(0, self._do_stop_on_main_thread)
+
+            # Primary: emit Qt signal to stopper (this is queued and executes on the Qt/main thread)
+            try:
+                if self._stopper is not None:
+                    self._stopper.stop_req.emit()
+                else:
+                    print("[Trigger] Stopper not available to emit signal.")
+            except Exception as e:
+                print(f"[Trigger] Exception emitting stopper signal: {e}")
+
+            # Fallback: also schedule via QTimer.singleShot(0, ...) to be extra robust
+            try:
+                if hasattr(self, "experiment") and self.experiment is not None:
+                    QTimer.singleShot(0, lambda: (
+                        (print("[Trigger] Fallback: calling stop_recording() via QTimer"),
+                         (self.experiment.stop_recording() if hasattr(self.experiment, "stop_recording") else None),
+                         (self.experiment.stop() if hasattr(self.experiment, "stop") else None)
+                        )
+                    ))
+            except Exception as e:
+                print(f"[Trigger] Exception scheduling fallback stop via QTimer: {e}")
+
             self._stopped = True
 
         time.sleep(self.poll_rate)
