@@ -19,6 +19,12 @@ import random
 import time
 import traceback
 
+# Triggering
+from stytra.triggering import Trigger
+import nidaqmx
+from nidaqmx.constants import TerminalConfiguration
+import time
+
 # -----------------------
 # NI DAQ
 # -----------------------
@@ -48,12 +54,6 @@ print(pylon.TlFactory.GetInstance().EnumerateDevices())
 # -----------------------
 # Trigger for Stytra (waits for rising edge on Dev1/ai0)
 # -----------------------
-from stytra.triggering import Trigger
-
-from stytra.triggering import Trigger
-import nidaqmx
-from nidaqmx.constants import TerminalConfiguration
-import time
 
 class NIRiseFallTrigger(Trigger):
     def __init__(self, channel, threshold=2.5, poll_rate=0.01):
