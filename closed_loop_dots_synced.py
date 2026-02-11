@@ -130,6 +130,33 @@ class NIRiseKillOnFallTrigger(Trigger):
         time.sleep(self.poll_rate)
         return False
 
+
+    # ... after you create `trigger` and `st = Stytra(..., exec=False, ...)`
+
+    _stop_done = False
+
+    def stop_if_killed():
+        global _stop_done
+        if _stop_done:
+            return
+        if trigger.kill_event.is_set():
+            _stop_done = True
+            print("[Main] kill_event detected -> stopping like GUI Stop (end_protocol)")
+            try:
+                # This is what the Stytra Stop button does:
+                # toolbar_control.sig_stop_protocol -> experiment.end_protocol :contentReference[oaicite:2]{index=2}
+                st.exp.end_protocol(
+                    save=True)  # stops protocol + finalizes recording + saves :contentReference[oaicite:3]{index=3}
+            except Exception as e:
+                print(f"[Main] end_protocol error: {e}")
+
+            # optional: stop polling once we handled it
+            timer.stop()
+
+    timer = QTimer()
+    timer.timeout.connect(stop_if_killed)
+    timer.start(20)  # ms
+
     def __del__(self):
         try:
             if self._task is not None:
@@ -273,7 +300,7 @@ if __name__ == "__main__":
         camera=dict(type="basler", cam_idx=0),
         stim_plot=True,
         scope_triggering=trigger,
-        recording=dict(extension="mp4"),  # ensure recording is actually enabled
+        #recording=dict(extension="mp4"),  # ensure recording is actually enabled
         exec=False,
     )
 
