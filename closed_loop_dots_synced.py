@@ -57,44 +57,24 @@ print(pylon.TlFactory.GetInstance().EnumerateDevices())
 
 # Drop-in replacement trigger class (put this where your other trigger was)
 
-class _Stopper(QObject):
-    """
-    Helper QObject that runs on the Qt/main thread and performs the actual stop calls.
-    We emit 'stop_req' from the trigger thread; the connected slot executes in the
-    Qt thread and calls Stytra's stop_recording/stop methods.
-    """
-    stop_req = pyqtSignal()
+from stytra.triggering import Trigger
+import nidaqmx
+from nidaqmx.constants import TerminalConfiguration
+import time
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.stop_req.connect(self._do_stop, type=0)  # default connection; queued across threads
-
-    @pyqtSlot()
-    def _do_stop(self):
-        try:
-            exp = getattr(self, "experiment_obj", None)
-            if exp is None:
-                print("[Stopper] No experiment object found on stopper.")
-                return
-            print("[Stopper] Calling experiment.stop_recording() on main thread")
-            try:
-                exp.stop_recording()
-            except Exception as e:
-                print(f"[Stopper] Exception in stop_recording(): {e}")
-            print("[Stopper] Calling experiment.stop() on main thread")
-            try:
-                exp.stop()
-            except Exception as e:
-                print(f"[Stopper] Exception in stop(): {e}")
-        except Exception as e:
-            print(f"[Stopper] Unexpected error in _do_stop(): {e}")
+DEVICE_NAME = "Dev1"
+AI_CHANNEL = "ai0"
+THRESHOLD = 2.5
+POLL_RATE = 0.01  # 100 Hz
+full_channel = f"{DEVICE_NAME}/{AI_CHANNEL}"
 
 
-class NIRiseFallTrigger(Trigger):
+class NIRiseKillOnFallTrigger(Trigger):
     """
-    Start on rising edge (> threshold) and stop recording on falling edge (< threshold).
-    Uses a helper Qt QObject with a signal to ensure the stop calls run on the main Qt thread.
+    - Rising edge (>THRESHOLD): returns True from check_trigger() -> Stytra start_event set (default Stytra behavior)
+    - Falling edge (<THRESHOLD) AFTER start: sets kill_event (request stop)
     """
+
     def __init__(self, channel, threshold=2.5, poll_rate=0.01):
         super().__init__()
         self.channel = channel
@@ -103,15 +83,12 @@ class NIRiseFallTrigger(Trigger):
 
         self._task = None
         self._prev_above = None
-        self._armed = False
-        self._stopped = False
-
-        # stopper will be created in on_start (so we can attach experiment)
-        self._stopper = None
+        self._started = False
 
     def _ensure_task(self):
         if self._task is not None:
             return
+
         self._task = nidaqmx.Task()
         self._task.ai_channels.add_ai_voltage_chan(
             self.channel,
@@ -122,94 +99,36 @@ class NIRiseFallTrigger(Trigger):
         print(f"[Trigger] Armed on {self.channel}: start > {self.threshold}V, stop < {self.threshold}V")
 
     def check_trigger(self):
-        """
-        Called repeatedly BEFORE experiment starts. Return True to start the experiment.
-        """
-        try:
-            self._ensure_task()
-            voltage = self._task.read()
-        except Exception as e:
-            print(f"[Trigger] Error reading DAQ in check_trigger(): {e}")
+        self._ensure_task()
+
+        voltage = self._task.read()
+        above = voltage > self.threshold
+
+        # initialize edge state
+        if self._prev_above is None:
+            self._prev_above = above
             time.sleep(self.poll_rate)
             return False
 
-        above = voltage > self.threshold
-
-        if self._prev_above is not None and above != self._prev_above:
+        # edge detected
+        if above != self._prev_above:
             if above:
                 print(f"RISING:  voltage crossed above {self.threshold}V → {voltage:.3f}V")
-                self._armed = True
+                self._started = True
                 self._prev_above = above
-                return True
+                return True  # Stytra will set start_event (default behavior)
             else:
-                print(f"FALLING (pre-start): voltage dropped below {self.threshold}V → {voltage:.3f}V")
+                # only request stop once we've started
+                if self._started:
+                    print(f"FALLING: voltage dropped below {self.threshold}V → {voltage:.3f}V")
+                    print("[Trigger] Setting kill_event (stop request)")
+                    self.kill_event.set()
+                else:
+                    print(f"FALLING (pre-start): voltage dropped below {self.threshold}V → {voltage:.3f}V")
 
         self._prev_above = above
         time.sleep(self.poll_rate)
         return False
-
-    def on_start(self):
-        """
-        Called once the experiment actually starts. Create the stopper and attach experiment.
-        """
-        print("[Trigger] Experiment started, creating stopper and monitoring for stop trigger")
-        # Create stopper and attach the experiment object so the stopper can call stop methods.
-        try:
-            self._stopper = _Stopper()
-            # attach experiment object for use by the stopper
-            try:
-                # self.experiment should be available (Stytra sets this on the trigger)
-                self._stopper.experiment_obj = self.experiment
-                print("[Trigger] Stopper attached to experiment.")
-            except Exception as e:
-                print(f"[Trigger] Could not attach experiment to stopper: {e}")
-        except Exception as e:
-            print(f"[Trigger] Error creating stopper: {e}")
-
-    def update(self):
-        """
-        Called repeatedly DURING the experiment. On falling edge, request stopper to execute stop on main thread.
-        """
-        if not self._armed or self._stopped:
-            # nothing to do
-            return
-
-        try:
-            voltage = self._task.read()
-        except Exception as e:
-            print(f"[Trigger] Error reading DAQ during update(): {e}")
-            time.sleep(self.poll_rate)
-            return
-
-        above = voltage > self.threshold
-
-        if not above:
-            print(f"STOP:    voltage fell below {self.threshold}V → {voltage:.3f}V")
-
-            # Primary: emit Qt signal to stopper (this is queued and executes on the Qt/main thread)
-            try:
-                if self._stopper is not None:
-                    self._stopper.stop_req.emit()
-                else:
-                    print("[Trigger] Stopper not available to emit signal.")
-            except Exception as e:
-                print(f"[Trigger] Exception emitting stopper signal: {e}")
-
-            # Fallback: also schedule via QTimer.singleShot(0, ...) to be extra robust
-            try:
-                if hasattr(self, "experiment") and self.experiment is not None:
-                    QTimer.singleShot(0, lambda: (
-                        (print("[Trigger] Fallback: calling stop_recording() via QTimer"),
-                         (self.experiment.stop_recording() if hasattr(self.experiment, "stop_recording") else None),
-                         (self.experiment.stop() if hasattr(self.experiment, "stop") else None)
-                        )
-                    ))
-            except Exception as e:
-                print(f"[Trigger] Exception scheduling fallback stop via QTimer: {e}")
-
-            self._stopped = True
-
-        time.sleep(self.poll_rate)
 
     def __del__(self):
         try:
@@ -342,16 +261,39 @@ class VisualStim_dots(Protocol):
         return stimuli
 
 
-if __name__ == "__main__":
-    trigger = NIRiseFallTrigger(
-        channel=full_channel,
-        threshold=THRESHOLD,
-        poll_rate=POLL_RATE,
-    )
+ifrom PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import QApplication
 
+if __name__ == "__main__":
+    trigger = NIRiseKillOnFallTrigger(full_channel, threshold=THRESHOLD, poll_rate=POLL_RATE)
+
+    # Create Stytra but do NOT start the Qt loop yet
     st = Stytra(
         protocol=VisualStim_dots(),
         camera=dict(type="basler", cam_idx=0),
         stim_plot=True,
         scope_triggering=trigger,
+        recording=dict(extension="mp4"),  # ensure recording is actually enabled
+        exec=False,
     )
+
+    def stop_if_killed():
+        if trigger.kill_event.is_set():
+            print("[Main] kill_event detected -> stopping recording + experiment")
+            try:
+                st.exp.stop_recording()
+            except Exception as e:
+                print(f"[Main] stop_recording error: {e}")
+            try:
+                st.exp.stop()
+            except Exception as e:
+                print(f"[Main] stop error: {e}")
+
+    # poll kill_event from the Qt/main thread
+    timer = QTimer()
+    timer.timeout.connect(stop_if_killed)
+    timer.start(20)  # ms
+
+    # start Qt event loop
+    app = st.exp.app  # Stytra created QApplication; experiment holds it
+    app.exec_()
