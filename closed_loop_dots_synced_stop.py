@@ -19,29 +19,6 @@ import random
 import time
 import traceback
 
-# Triggering
-from stytra.triggering import Trigger
-import nidaqmx
-from nidaqmx.constants import TerminalConfiguration
-import time
-
-# -----------------------
-# NI DAQ
-# -----------------------
-from stytra.triggering import Trigger
-import nidaqmx
-from nidaqmx.constants import TerminalConfiguration
-import time
-
-DEVICE_NAME = "Dev1"
-AI_CHANNEL = "ai0"
-THRESHOLD = 2.5
-POLL_RATE = 0.01  # 100 Hz
-full_channel = f"{DEVICE_NAME}/{AI_CHANNEL}"
-
-# -----------------------
-# Stytra checks / prints (kept)
-# -----------------------
 import stytra
 print(stytra.__file__)
 
@@ -51,24 +28,6 @@ print(sorted(camera_class_dict.keys()))
 from pypylon import pylon
 print(pylon.TlFactory.GetInstance().EnumerateDevices())
 
-# -----------------------
-# Trigger for Stytra (waits for rising edge on Dev1/ai0)
-# -----------------------
-
-# Drop-in replacement trigger class (put this where your other trigger was)
-
-from stytra.triggering import Trigger
-import nidaqmx
-from nidaqmx.constants import TerminalConfiguration
-import time
-
-DEVICE_NAME = "Dev1"
-AI_CHANNEL = "ai0"
-THRESHOLD = 2.5
-POLL_RATE = 0.01  # 100 Hz
-full_channel = f"{DEVICE_NAME}/{AI_CHANNEL}"
-
-
 import time
 import nidaqmx
 from nidaqmx.constants import TerminalConfiguration
@@ -76,33 +35,28 @@ from stytra.triggering import Trigger
 
 from PyQt5.QtCore import QTimer
 
+# -----------------------
+# Trigger for Stytra (waits for rising edge on Dev1/ai0)
+# -----------------------
+
 DEVICE_NAME = "Dev1"
 AI_CHANNEL = "ai0"
 THRESHOLD = 2.5
-POLL_RATE = 0.01  # 100 Hz
+POLL_RATE = 0.02  # 200 Hz
 full_channel = f"{DEVICE_NAME}/{AI_CHANNEL}"
 
-
-class NIRiseKillOnFallTrigger(Trigger):
-    """
-    Rising edge (> threshold): returns True from check_trigger() -> Stytra starts protocol.
-    Falling edge (< threshold) AFTER start: sets kill_event -> main thread ends protocol + saves.
-    """
-
+class NIRiseOnlyTrigger(Trigger):
     def __init__(self, channel, threshold=2.5, poll_rate=0.01):
         super().__init__()
         self.channel = channel
         self.threshold = float(threshold)
         self.poll_rate = float(poll_rate)
-
         self._task = None
         self._prev_above = None
-        self._started = False
 
     def _ensure_task(self):
         if self._task is not None:
             return
-
         self._task = nidaqmx.Task()
         self._task.ai_channels.add_ai_voltage_chan(
             self.channel,
@@ -110,7 +64,7 @@ class NIRiseKillOnFallTrigger(Trigger):
             min_val=-10.0,
             max_val=10.0,
         )
-        print(f"[Trigger] Armed on {self.channel}: start > {self.threshold}V, stop < {self.threshold}V")
+        print(f"[Trigger] Armed on {self.channel}: start > {self.threshold}V")
 
     def check_trigger(self):
         self._ensure_task()
@@ -118,32 +72,18 @@ class NIRiseKillOnFallTrigger(Trigger):
         voltage = float(self._task.read())
         above = voltage > self.threshold
 
-        # initialize previous state
         if self._prev_above is None:
             self._prev_above = above
             time.sleep(self.poll_rate)
             return False
 
-        # detect edge
-        if above != self._prev_above:
-            if above:
-                # Rising edge -> start
-                print(f"[Trigger] RISING: crossed above {self.threshold}V -> {voltage:.3f}V")
-                self._started = True
-                self._prev_above = above
-                return True
-            else:
-                # Falling edge -> request stop (only if already started)
-                if self._started:
-                    print(f"[Trigger] FALLING: dropped below {self.threshold}V -> {voltage:.3f}V")
-                    print("[Trigger] Setting kill_event (stop request)")
-                    self.kill_event.set()
-                else:
-                    print(f"[Trigger] FALLING (pre-start): {voltage:.3f}V")
-
+        # rising edge only
+        fired = (above and not self._prev_above)
+        if fired:
+            print(f"[Trigger] RISING: {voltage:.3f}V")
         self._prev_above = above
         time.sleep(self.poll_rate)
-        return False
+        return fired
 
     def close(self):
         try:
@@ -152,11 +92,6 @@ class NIRiseKillOnFallTrigger(Trigger):
                 self._task = None
         except Exception:
             pass
-
-    def __del__(self):
-        self.close()
-
-
 
 
 # -----------------------
@@ -284,51 +219,54 @@ class VisualStim_dots(Protocol):
 
 if __name__ == "__main__":
     # Your protocol class must already be defined above this point
-    trigger = NIRiseKillOnFallTrigger(full_channel, threshold=THRESHOLD, poll_rate=POLL_RATE)
+    trigger = NIRiseOnlyTrigger(full_channel, threshold=THRESHOLD, poll_rate=POLL_RATE)
 
     st = Stytra(
         protocol=VisualStim_dots(),
         camera=dict(type="basler", cam_idx=0),
         stim_plot=True,
         scope_triggering=trigger,
-        exec=False,  # IMPORTANT: we run the Qt loop ourselves below
-        # recording=dict(extension="mp4"),  # optional, only if you want video
+        exec=False,
     )
+    app = st.exp.app
+    app.exec_()
 
-    # Make sure we only stop once
-    stop_done = {"value": False}
 
-    def stop_if_killed():
-        if stop_done["value"]:
+    def stop_on_fall():
+        # only stop if a protocol is currently running
+        # (attribute name can vary a bit across Stytra versions)
+        protocol_running = getattr(st.exp, "protocol_running", None)
+        if callable(protocol_running):
+            running = protocol_running()
+        else:
+            running = bool(getattr(st.exp, "running", True))
+
+        v = float(stop_task.read())
+        above = v > THRESHOLD
+
+        if state["prev_above"] is None:
+            state["prev_above"] = above
             return
 
-        if trigger.kill_event.is_set():
-            stop_done["value"] = True
-            print("[Main] kill_event detected -> stopping like GUI Stop (end_protocol(save=True))")
+        # Arm the stop logic only once we have actually started running
+        if running:
+            state["armed_stop"] = True
 
-            try:
-                # This is the clean “stop + save everything” path:
-                st.exp.end_protocol(save=True)
-            except Exception as e:
-                print(f"[Main] end_protocol(save=True) failed: {e}")
-                # Fallback (less ideal, but better than hanging):
+        # Falling edge: only stop if we were armed (i.e., had a started trial)
+        if state["armed_stop"] and (not above) and state["prev_above"]:
+            if not state["stop_done"]:
+                state["stop_done"] = True
+                print(f"[Stopper] FALLING: {v:.3f}V -> stopping protocol (save=True)")
                 try:
-                    st.exp.stop_recording()
-                except Exception:
-                    pass
-                try:
-                    st.exp.stop()
-                except Exception:
-                    pass
+                    st.exp.end_protocol(save=True)
+                finally:
+                    # re-arm for the next trigger/trial:
+                    state["stop_done"] = False
+                    state["armed_stop"] = False
 
-            # Stop polling after handling
-            timer.stop()
+        state["prev_above"] = above
 
-    # Poll kill_event from the Qt/main thread
+
     timer = QTimer()
-    timer.timeout.connect(stop_if_killed)
-    timer.start(20)  # ms
-
-    # Start Qt event loop
-    app = st.exp.app  # Stytra created QApplication internally
-    app.exec_()
+    timer.timeout.connect(stop_on_fall)
+    timer.start(10)  # 100 Hz-ish
