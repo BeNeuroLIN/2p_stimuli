@@ -88,10 +88,15 @@ class CaptureConfig:
     triggered: bool
     trigger_line: str = "Line0"
     trigger_selector: str = "AcquisitionStart"  # or "FrameStart"
-    pixel_format: str = "Mono8"  # good default for physiological signals
-    exposure_us: Optional[float] = None  # set if you want fixed exposure
-    gain_db: Optional[float] = None      # set if you want fixed gain
-    timeout_ms: int = 2000               # image retrieval timeout
+    pixel_format: str = "Mono8"
+    exposure_us: Optional[float] = None
+    gain_db: Optional[float] = None
+    timeout_ms: int = 2000
+
+    # NEW:
+    stop_on_falling: bool = True  # stop recording when TTL goes low
+    max_triggered_s: Optional[float] = None  # safety cap; None = no cap (not recommended)
+    use_acquisition_stop: bool = True  # try to use AcquisitionStop trigger if supported
 
 
 def _set_enum(nodemap, node_name: str, entry_name: str) -> None:
@@ -116,6 +121,36 @@ def _set_bool(nodemap, node_name: str, value: bool) -> None:
     if not PySpin.IsAvailable(node) or not PySpin.IsWritable(node):
         raise RuntimeError(f"Node {node_name} not writable/available.")
     node.SetValue(value)
+
+def _is_enum_entry_available(nodemap, node_name: str, entry_name: str) -> bool:
+    node = PySpin.CEnumerationPtr(nodemap.GetNode(node_name))
+    if not PySpin.IsAvailable(node) or not PySpin.IsReadable(node):
+        return False
+    entry = node.GetEntryByName(entry_name)
+    return PySpin.IsAvailable(entry) and PySpin.IsReadable(entry)
+
+
+def _try_set_enum(nodemap, node_name: str, entry_name: str) -> bool:
+    try:
+        _set_enum(nodemap, node_name, entry_name)
+        return True
+    except Exception:
+        return False
+
+
+def read_line_status(nodemap, line_name: str) -> Optional[bool]:
+    """
+    Returns True/False for the current electrical level of the selected line,
+    or None if the camera doesn't expose LineStatus.
+    """
+    try:
+        _set_enum(nodemap, "LineSelector", line_name)
+        node = PySpin.CBooleanPtr(nodemap.GetNode("LineStatus"))
+        if not PySpin.IsAvailable(node) or not PySpin.IsReadable(node):
+            return None
+        return bool(node.GetValue())
+    except Exception:
+        return None
 
 
 def configure_camera_for_freerun(cam: PySpin.CameraPtr, cfg: CaptureConfig) -> None:
@@ -154,29 +189,40 @@ def configure_camera_for_freerun(cam: PySpin.CameraPtr, cfg: CaptureConfig) -> N
 def configure_camera_for_triggered(cam: PySpin.CameraPtr, cfg: CaptureConfig) -> None:
     nodemap = cam.GetNodeMap()
 
-    # Acquisition mode: Continuous (common for triggered AcquisitionStart)
     _set_enum(nodemap, "AcquisitionMode", "Continuous")
 
-    # Configure the input line (if supported)
-    # This sets the line as an input; actual voltage threshold is typically electrical/hardware-level.
+    # Configure line as input if possible
     try:
         _set_enum(nodemap, "LineSelector", cfg.trigger_line)
         _set_enum(nodemap, "LineMode", "Input")
     except Exception:
-        # Not all models expose LineMode/LineSelector the same way
         pass
 
-    # Trigger settings
-    _set_enum(nodemap, "TriggerMode", "Off")  # must be off to change settings
+    # IMPORTANT: TriggerMode applies to the currently selected TriggerSelector on many cameras.
+    # So we configure AcquisitionStart first...
+    _try_set_enum(nodemap, "TriggerMode", "Off")
 
-    # Choose whether we trigger AcquisitionStart (one pulse starts stream) or FrameStart (pulse per frame)
-    _set_enum(nodemap, "TriggerSelector", cfg.trigger_selector)
-
+    _set_enum(nodemap, "TriggerSelector", "AcquisitionStart")
     _set_enum(nodemap, "TriggerSource", cfg.trigger_line)
     _set_enum(nodemap, "TriggerActivation", "RisingEdge")
-
-    # Turn trigger on
     _set_enum(nodemap, "TriggerMode", "On")
+
+    # Optionally configure AcquisitionStop on falling edge (if the camera supports it)
+    cfg._acq_stop_configured = False  # attach runtime flag on cfg
+    if cfg.use_acquisition_stop and _is_enum_entry_available(nodemap, "TriggerSelector", "AcquisitionStop"):
+        try:
+            _set_enum(nodemap, "TriggerSelector", "AcquisitionStop")
+            _set_enum(nodemap, "TriggerSource", cfg.trigger_line)
+            _set_enum(nodemap, "TriggerActivation", "FallingEdge")
+            _set_enum(nodemap, "TriggerMode", "On")
+            cfg._acq_stop_configured = True
+            print("[INFO] AcquisitionStop trigger configured (FallingEdge).")
+        except Exception:
+            cfg._acq_stop_configured = False
+            print("[WARN] Camera supports AcquisitionStop but configuration failed; will use LineStatus polling.")
+    else:
+        if cfg.use_acquisition_stop:
+            print("[INFO] AcquisitionStop trigger not available; will use LineStatus polling to stop on falling edge.")
 
     # Pixel format
     try:
@@ -199,7 +245,6 @@ def configure_camera_for_triggered(cam: PySpin.CameraPtr, cfg: CaptureConfig) ->
         except Exception:
             pass
 
-
 # -------------------------
 # Recording
 # -------------------------
@@ -220,56 +265,126 @@ def _create_avi_recorder(output_path: str, fps: float) -> PySpin.SpinVideo:
 def record_video(cam: PySpin.CameraPtr, cfg: CaptureConfig, wait_for_trigger_first_frame: bool) -> str:
     """
     Records a video to disk and returns the output file path.
-    If wait_for_trigger_first_frame=True, the function blocks until the first image arrives
-    (i.e., the trigger happens for AcquisitionStart, or first FrameStart trigger).
+
+    If wait_for_trigger_first_frame=True, blocks until first image arrives (rising edge / start trigger).
+
+    Stop behavior:
+      - In free-run: records duration_s seconds worth of frames (as before)
+      - In triggered: starts on rising edge, then stops when TTL line goes LOW (falling edge),
+        using LineStatus polling. If AcquisitionStop trigger is configured, the camera may also
+        stop streaming on falling edge; we handle that too.
     """
     stem, out_path = next_2p_name(cfg.dest_dir, cfg.base_prefix, ext=".avi")
     print(f"[INFO] Recording will be saved as: {out_path}")
 
     recorder = _create_avi_recorder(out_path, cfg.fps)
 
-    # Decide how many frames to capture
+    nodemap = cam.GetNodeMap()
+
+    # Free-run target frames
     target_frames = max(1, int(round(cfg.duration_s * cfg.fps)))
-    print(f"[INFO] Target: {target_frames} frames at ~{cfg.fps} fps (~{cfg.duration_s:.2f} s)")
 
     t0 = time.time()
     frames_written = 0
+    started = False
 
-    # If triggered, you often want to block until first frame (meaning trigger occurred)
     if wait_for_trigger_first_frame:
         print("[INFO] Waiting for rising-edge trigger (first frame)...")
-        # Keep trying until we get an image (timeout loops are fine)
         while True:
             try:
                 img = cam.GetNextImage(cfg.timeout_ms)
                 if img.IsIncomplete():
                     img.Release()
                     continue
-                # Got first valid frame: trigger happened
                 recorder.Append(img)
                 img.Release()
                 frames_written = 1
+                started = True
                 print("[INFO] Trigger received, recording started.")
                 break
             except PySpin.SpinnakerException:
-                # timeout - keep waiting
                 continue
 
-    # Now record remaining frames
-    while frames_written < target_frames:
-        try:
-            img = cam.GetNextImage(cfg.timeout_ms)
-            if img.IsIncomplete():
+    # Decide mode: triggered stop-on-falling vs free-run fixed duration
+    triggered_stop = wait_for_trigger_first_frame and cfg.stop_on_falling
+
+    if not triggered_stop:
+        # --------------------
+        # FREE-RUN: fixed size
+        # --------------------
+        print(f"[INFO] Target: {target_frames} frames at ~{cfg.fps} fps (~{cfg.duration_s:.2f} s)")
+        while frames_written < target_frames:
+            try:
+                img = cam.GetNextImage(cfg.timeout_ms)
+                if img.IsIncomplete():
+                    img.Release()
+                    continue
+                recorder.Append(img)
                 img.Release()
+                frames_written += 1
+            except PySpin.SpinnakerException as e:
+                print(f"[WARN] Image grab issue/timeout: {e}")
                 continue
-            recorder.Append(img)
-            img.Release()
-            frames_written += 1
-        except PySpin.SpinnakerException as e:
-            # If in FrameStart trigger mode, timeouts can happen if triggers are slow.
-            # Continue until we hit target_frames (or user stops the program).
-            print(f"[WARN] Image grab issue/timeout: {e}")
-            continue
+
+    else:
+        # ----------------------------------------
+        # TRIGGERED: stop when TTL falls (line low)
+        # ----------------------------------------
+        print("[INFO] Triggered stop condition: falling edge / line goes LOW.")
+
+        # optional safety cap
+        max_s = cfg.max_triggered_s
+        if max_s is not None:
+            print(f"[INFO] Safety cap enabled: max_triggered_s={max_s:.2f}s")
+
+        # read initial status if possible (may already be high)
+        line_status = read_line_status(nodemap, cfg.trigger_line)
+        if line_status is None:
+            print("[WARN] LineStatus not readable on this camera; falling-edge stop will rely on timeouts/safety cap.")
+        else:
+            print(f"[INFO] LineStatus after start: {'HIGH' if line_status else 'LOW'}")
+
+        consecutive_timeouts = 0
+
+        while True:
+            # Stop if TTL is low (best-effort)
+            if line_status is False:
+                print("[INFO] LineStatus is LOW -> stopping recording.")
+                break
+
+            # Safety cap
+            if max_s is not None and (time.time() - t0) >= max_s:
+                print("[INFO] Safety cap reached -> stopping recording.")
+                break
+
+            try:
+                img = cam.GetNextImage(cfg.timeout_ms)
+                consecutive_timeouts = 0
+                if img.IsIncomplete():
+                    img.Release()
+                    # refresh line status and continue
+                    line_status = read_line_status(nodemap, cfg.trigger_line)
+                    continue
+                recorder.Append(img)
+                img.Release()
+                frames_written += 1
+
+                # refresh trigger line level
+                line_status = read_line_status(nodemap, cfg.trigger_line)
+
+            except PySpin.SpinnakerException as e:
+                # If AcquisitionStop is configured, a falling edge may stop acquisition and cause timeouts.
+                consecutive_timeouts += 1
+                print(f"[WARN] Image grab timeout/issue: {e}")
+
+                # If we already started and now get repeated timeouts, assume acquisition stopped (common after AcqStop)
+                if started and consecutive_timeouts >= 3:
+                    print("[INFO] Repeated timeouts after start -> assuming acquisition stopped (possible falling-edge stop).")
+                    break
+
+                # refresh line status (maybe line went low)
+                line_status = read_line_status(nodemap, cfg.trigger_line)
+                continue
 
     recorder.Close()
     dt = time.time() - t0
@@ -340,6 +455,20 @@ def run(cfg: CaptureConfig) -> None:
         # Start acquisition so the camera is "live" in free-run
         cam.BeginAcquisition()
 
+        # If user started the program in --mode trigger, arm immediately and record once
+        if cfg.triggered:
+            print("[INFO] Starting in trigger mode: arming immediately.")
+            cam.EndAcquisition()
+            configure_camera_for_triggered(cam, cfg)
+            cam.BeginAcquisition()
+            record_video(cam, cfg, wait_for_trigger_first_frame=True)
+
+            # Return to free-run afterwards
+            cam.EndAcquisition()
+            configure_camera_for_freerun(cam, cfg)
+            cam.BeginAcquisition()
+            print("[INFO] Returned to free-run mode.")
+
         listener = CommandListener()
         listener.start()
 
@@ -381,6 +510,7 @@ def run(cfg: CaptureConfig) -> None:
                 configure_camera_for_triggered(cam, cfg)
                 cam.BeginAcquisition()
 
+
                 # Record (wait for trigger before first frame)
                 record_video(cam, cfg, wait_for_trigger_first_frame=True)
 
@@ -421,6 +551,13 @@ def parse_args() -> CaptureConfig:
     p.add_argument("--exposure-us", type=float, default=None, help="Fixed exposure time in microseconds (optional).")
     p.add_argument("--gain-db", type=float, default=None, help="Fixed gain in dB (optional).")
     p.add_argument("--timeout-ms", type=int, default=2000, help="Image grab timeout in ms (default 2000).")
+
+    p.add_argument("--stop-on-falling", action="store_true",
+                   help="In triggered recording, stop when trigger line goes LOW (falling edge).")
+    p.add_argument("--max-triggered-s", type=float, default=None,
+                   help="Safety cap for triggered recording duration (seconds). Recommended.")
+    p.add_argument("--no-acq-stop", action="store_true",
+                   help="Disable configuring AcquisitionStop trigger (falling edge) even if supported.")
     a = p.parse_args()
 
     return CaptureConfig(
@@ -435,6 +572,9 @@ def parse_args() -> CaptureConfig:
         exposure_us=a.exposure_us,
         gain_db=a.gain_db,
         timeout_ms=a.timeout_ms,
+        stop_on_falling=a.stop_on_falling,
+        max_triggered_s=a.max_triggered_s,
+        use_acquisition_stop=(not a.no_acq_stop),
     )
 
 
